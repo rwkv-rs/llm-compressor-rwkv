@@ -130,6 +130,9 @@ class QuantizationMixin(HooksMixin):
         and protects recurrent TimeMix and v_first dataflow.
     :param target_policy_metadata: resolved policy decisions written to serialized
         recipes. This field is recomputed from the current model before quantization.
+    :param target_policy_profile: RWKV-7 protection profile. ``critical-high``
+        quantizes only ChannelMix projections; ``v-first-dataflow`` is the explicit
+        protection ablation and still keeps every v_first producer/consumer precise.
     """
 
     config_groups: dict[str, QuantizationScheme] | None = None
@@ -147,6 +150,9 @@ class QuantizationMixin(HooksMixin):
     observer: dict[str, str] | None = None
     bypass_divisibility_checks: bool = False
     target_policy: Literal["rwkv7"] | None = None
+    target_policy_profile: Literal["critical-high", "v-first-dataflow"] = (
+        "critical-high"
+    )
     target_policy_metadata: QuantizationTargetPolicyMetadata | None = None
 
     _calibration_hooks: set[RemovableHandle] = PrivateAttr(default_factory=set)
@@ -264,6 +270,7 @@ class QuantizationMixin(HooksMixin):
                 resolved_targets=self.resolved_targets,
                 ignore=self.ignore,
                 kv_cache_enabled=self.kv_cache_scheme is not None,
+                protection_profile=self.target_policy_profile,
             )
             self.ignore = policy_ignore
             self.target_policy_metadata = metadata

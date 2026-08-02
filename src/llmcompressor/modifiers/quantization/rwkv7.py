@@ -57,9 +57,26 @@ _SUPPORTED_FRAMEWORK_VERSIONS = {
     "compressed_tensors": "0.17.2.a20260731",
     "transformers": "5.15.0.dev0",
 }
+_CANDIDATE_SPECS = {
+    "nvfp4-w4a4": {
+        "scheme": "NVFP4",
+        "protection_profile": "critical-high",
+    },
+    "nvfp4-w4a16": {
+        "scheme": "NVFP4A16",
+        "protection_profile": "critical-high",
+    },
+    "nvfp4-w4a16-protection-ablation": {
+        "scheme": "NVFP4A16",
+        "protection_profile": "v-first-dataflow",
+    },
+    "w8a16-critical-high": {
+        "scheme": "W8A16",
+        "protection_profile": "critical-high",
+    },
+}
 _CANDIDATE_SCHEMES = {
-    "nvfp4-w4a4": "NVFP4",
-    "nvfp4-w4a16": "NVFP4A16",
+    candidate: spec["scheme"] for candidate, spec in _CANDIDATE_SPECS.items()
 }
 _FRESH_RELOAD_GENERATE_SEED = 20260801
 _FRESH_RELOAD_PROMPT_IDS = [1, 2, 3, 4]
@@ -134,9 +151,7 @@ class RWKV7VLLMLoaderMetadata(BaseModel):
     source_format: Literal["standard_hf"] = "standard_hf"
     load_format: Literal["safetensors"] = "safetensors"
     quant_method: Literal["compressed-tensors"] = "compressed-tensors"
-    quantization_format: Literal["nvfp4-pack-quantized"] = (
-        "nvfp4-pack-quantized"
-    )
+    quantization_format: Literal["nvfp4-pack-quantized", "pack-quantized"]
     embedding_name: Literal["model.embeddings.weight"] = (
         "model.embeddings.weight"
     )
@@ -157,7 +172,12 @@ class RWKV7ArtifactContract(BaseModel):
     schema_version: Literal[1] = 1
     repository: RWKV7RepositoryContract
     checkpoint: RWKV7CheckpointContract | None
-    candidate: Literal["nvfp4-w4a4", "nvfp4-w4a16"]
+    candidate: Literal[
+        "nvfp4-w4a4",
+        "nvfp4-w4a16",
+        "nvfp4-w4a16-protection-ablation",
+        "w8a16-critical-high",
+    ]
     target_policy: QuantizationTargetPolicyMetadata
     vllm: RWKV7VLLMLoaderMetadata
     formal_checkpoint: bool
@@ -170,15 +190,21 @@ class RWKV7QuantizationRecipeMetadata(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: Literal[1] = 1
-    candidate: Literal["nvfp4-w4a4", "nvfp4-w4a16"]
+    candidate: Literal[
+        "nvfp4-w4a4",
+        "nvfp4-w4a16",
+        "nvfp4-w4a16-protection-ablation",
+        "w8a16-critical-high",
+    ]
     candidate_order: list[str]
-    algorithm: Literal["NVFP4"] = "NVFP4"
-    weight_dtype: Literal["float4"] = "float4"
-    weight_group_size: Literal[16] = 16
-    weight_scale_dtype: Literal["float8_e4m3fn"] = "float8_e4m3fn"
+    algorithm: Literal["NVFP4", "INT8"]
+    weight_dtype: Literal["float4", "int8"]
+    weight_group_size: Literal[16, 128]
+    weight_scale_dtype: Literal["float8_e4m3fn", "float32"]
     input_dtype: Literal["float4", "float16"]
     input_scale: Literal["dynamic_local", "none"]
     input_scale_dtype: Literal["float8_e4m3fn"] | None
+    protection_profile: Literal["critical-high", "v-first-dataflow"]
     targets: list[str]
     framework_versions: dict[str, str]
     quantization_applied: Literal[False] = False
@@ -215,6 +241,9 @@ class QuantizationTargetPolicyMetadata(BaseModel):
     policy: Literal["rwkv7"] = "rwkv7"
     policy_version: Literal[1] = 1
     model_type: Literal["rwkv7"] = "rwkv7"
+    protection_profile: Literal["critical-high", "v-first-dataflow"] = (
+        "critical-high"
+    )
     base_model_prefix: str
     selection: QuantizationTargetPolicyDecision
     protections: list[QuantizationTargetPolicyDecision]
@@ -260,6 +289,11 @@ def build_rwkv7_artifact_contract(
         candidate=candidate,
         target_policy=target_policy,
         vllm=RWKV7VLLMLoaderMetadata(
+            quantization_format=(
+                "pack-quantized"
+                if candidate == "w8a16-critical-high"
+                else "nvfp4-pack-quantized"
+            ),
             quantized_modules=list(target_policy.selection.names),
             protected_modules=protected_modules,
             protected_tensors=protected_tensors,
@@ -281,7 +315,7 @@ def _installed_framework_versions() -> dict[str, str]:
 def _validate_framework_versions(versions: dict[str, str]) -> None:
     if versions != _SUPPORTED_FRAMEWORK_VERSIONS:
         raise RuntimeError(
-            "RWKV-7 NVFP4 recipe requires the validated framework versions: "
+            "RWKV-7 candidate recipes require the validated framework versions: "
             f"expected={_SUPPORTED_FRAMEWORK_VERSIONS} actual={versions}"
         )
 
@@ -296,14 +330,25 @@ def _validate_candidate_scheme(
     weights = scheme.weights
     inputs = scheme.input_activations
     expected_inputs = candidate == "nvfp4-w4a4"
-    valid_weights = (
-        weights is not None
-        and weights.num_bits == 4
-        and str(weights.type) == "float"
-        and str(weights.strategy) == "tensor_group"
-        and weights.group_size == 16
-        and str(weights.scale_dtype) == "torch.float8_e4m3fn"
-    )
+    is_w8 = candidate == "w8a16-critical-high"
+    if is_w8:
+        valid_weights = (
+            weights is not None
+            and weights.num_bits == 8
+            and str(weights.type) == "int"
+            and str(weights.strategy) == "group"
+            and weights.group_size == 128
+            and weights.symmetric is True
+        )
+    else:
+        valid_weights = (
+            weights is not None
+            and weights.num_bits == 4
+            and str(weights.type) == "float"
+            and str(weights.strategy) == "tensor_group"
+            and weights.group_size == 16
+            and str(weights.scale_dtype) == "torch.float8_e4m3fn"
+        )
     valid_inputs = (inputs is not None) == expected_inputs
     if inputs is not None:
         valid_inputs = valid_inputs and (
@@ -323,9 +368,14 @@ def _validate_candidate_scheme(
     return RWKV7QuantizationRecipeMetadata(
         candidate=candidate,
         candidate_order=list(_CANDIDATE_SCHEMES),
+        algorithm="INT8" if is_w8 else "NVFP4",
+        weight_dtype="int8" if is_w8 else "float4",
+        weight_group_size=128 if is_w8 else 16,
+        weight_scale_dtype="float32" if is_w8 else "float8_e4m3fn",
         input_dtype="float4" if inputs is not None else "float16",
         input_scale="dynamic_local" if inputs is not None else "none",
         input_scale_dtype="float8_e4m3fn" if inputs is not None else None,
+        protection_profile=_CANDIDATE_SPECS[candidate]["protection_profile"],
         targets=targets,
         framework_versions=framework_versions,
     )
@@ -337,7 +387,7 @@ def build_rwkv7_quantization_recipe(
     *,
     framework_versions: dict[str, str] | None = None,
 ):
-    """Build a validated NVFP4-first recipe without applying quantization."""
+    """Build one validated closed-set recipe without applying quantization."""
 
     if candidate not in _CANDIDATE_SCHEMES:
         raise ValueError(
@@ -356,6 +406,7 @@ def build_rwkv7_quantization_recipe(
     modifier = QuantizationModifier(
         scheme=_CANDIDATE_SCHEMES[candidate],
         target_policy="rwkv7",
+        target_policy_profile=_CANDIDATE_SPECS[candidate]["protection_profile"],
     )
     modifier._apply_target_policy(model)
     recipe_metadata = _validate_candidate_scheme(
@@ -364,6 +415,11 @@ def build_rwkv7_quantization_recipe(
         targets=list(modifier.target_policy_metadata.selection.names),
         framework_versions=versions,
     )
+    if (
+        modifier.target_policy_metadata.protection_profile
+        != recipe_metadata.protection_profile
+    ):
+        raise RuntimeError("RWKV-7 target protection profile drifted from candidate")
     modifier.target_policy_metadata = modifier.target_policy_metadata.model_copy(
         update={"recipe": recipe_metadata}
     )
@@ -386,13 +442,17 @@ def audit_rwkv7_quantized_checkpoint(
         loaded_contract = RWKV7ArtifactContract.model_validate(serialized_contract)
         if loaded_contract != artifact_contract:
             raise RuntimeError("RWKV-7 serialized artifact contract drifted")
-    expected_format = "nvfp4-pack-quantized"
+    expected_format = (
+        "pack-quantized"
+        if candidate == "w8a16-critical-high"
+        else "nvfp4-pack-quantized"
+    )
     if (
         quantization.get("quant_method") != "compressed-tensors"
         or quantization.get("quantization_status") != "compressed"
         or quantization.get("format") != expected_format
     ):
-        raise RuntimeError("RWKV-7 checkpoint lacks compressed NVFP4 metadata")
+        raise RuntimeError("RWKV-7 checkpoint lacks expected compression metadata")
     groups = quantization.get("config_groups", {})
     if not isinstance(groups, dict) or len(groups) != 1:
         raise RuntimeError("RWKV-7 checkpoint has an invalid quantization config group")
@@ -411,36 +471,52 @@ def audit_rwkv7_quantized_checkpoint(
                     handle.get_slice(name).get_dtype(),
                 )
     for target in expected_targets:
-        required = {
-            f"{target}.weight_packed",
-            f"{target}.weight_scale",
-            f"{target}.weight_global_scale",
-        }
-        if candidate == "nvfp4-w4a4":
-            required.add(f"{target}.input_global_scale")
-        elif f"{target}.input_global_scale" in tensors:
-            raise RuntimeError(
-                f"W4A16 target unexpectedly quantized its input: {target}"
-            )
+        if candidate == "w8a16-critical-high":
+            required = {
+                f"{target}.weight_packed",
+                f"{target}.weight_scale",
+                f"{target}.weight_shape",
+            }
+        else:
+            required = {
+                f"{target}.weight_packed",
+                f"{target}.weight_scale",
+                f"{target}.weight_global_scale",
+            }
+            if candidate == "nvfp4-w4a4":
+                required.add(f"{target}.input_global_scale")
+        if not input_quantized and f"{target}.input_global_scale" in tensors:
+            raise RuntimeError(f"weight-only target quantized its input: {target}")
         missing = sorted(required - tensors.keys())
         if missing or f"{target}.weight" in tensors:
             raise RuntimeError(
-                "RWKV-7 target was not physically NVFP4-compressed: "
+                "RWKV-7 target was not physically compressed: "
                 f"{target}; missing={missing}"
             )
-        if (
-            tensors[f"{target}.weight_packed"][1] != "U8"
-            or tensors[f"{target}.weight_scale"][1] != "F8_E4M3"
-        ):
+        expected_packed_dtype = (
+            "I32" if candidate == "w8a16-critical-high" else "U8"
+        )
+        if tensors[f"{target}.weight_packed"][1] != expected_packed_dtype:
             raise RuntimeError(
-                f"RWKV-7 target has drifted packed/scale dtypes: {target}"
+                f"RWKV-7 target has drifted packed dtype: {target}"
             )
-    protected = [name for name in tensors if (".att." in name or name == "head.weight")]
-    if any(
-        name.endswith(("weight_packed", "weight_scale", "weight_global_scale"))
-        for name in protected
-    ):
-        raise RuntimeError("RWKV-7 protected TimeMix/head tensors were compressed")
+        if (
+            candidate != "w8a16-critical-high"
+            and tensors[f"{target}.weight_scale"][1] != "F8_E4M3"
+        ):
+            raise RuntimeError(f"RWKV-7 target has drifted scale dtype: {target}")
+    protected_names = set()
+    if artifact_contract is not None:
+        protected_names.update(artifact_contract.vllm.protected_tensors)
+        protected_names.update(
+            f"{name}.weight" for name in artifact_contract.vllm.protected_modules
+        )
+        for name in artifact_contract.vllm.protected_modules:
+            if any(key.startswith(f"{name}.weight_") for key in tensors):
+                raise RuntimeError(
+                    f"RWKV-7 protected module was compressed: {name}"
+                )
+    protected = sorted(protected_names & tensors.keys())
     return {
         "format": expected_format,
         "targets": expected_targets,
@@ -473,7 +549,7 @@ def quantize_rwkv7_oneshot(
     *,
     calibration_dataset: object | None,
     processor: object | None,
-    candidates: tuple[str, ...] = ("nvfp4-w4a4", "nvfp4-w4a16"),
+    candidates: tuple[str, ...] = tuple(_CANDIDATE_SCHEMES),
     forced_candidate: str | None = None,
     checkpoint_contract: RWKV7CheckpointContract | None = None,
     fresh_reload_prompt_ids: list[int] | None = None,
@@ -584,7 +660,12 @@ runtime_dtype = config.dtype
 assert isinstance(runtime_dtype, torch.dtype)
 contract = getattr(config, 'rwkv7_quantization_metadata')
 assert contract['schema_version'] == 1
-assert contract['candidate'] in ('nvfp4-w4a4', 'nvfp4-w4a16')
+assert contract['candidate'] in (
+    'nvfp4-w4a4',
+    'nvfp4-w4a16',
+    'nvfp4-w4a16-protection-ablation',
+    'w8a16-critical-high',
+)
 assert contract['vllm']['architecture'] == 'Rwkv7ForCausalLM'
 assert contract['vllm']['source_format'] == 'standard_hf'
 assert contract['vllm']['legacy_pth_direct_load'] is False
@@ -881,7 +962,12 @@ def run_rwkv7_checkpoint_candidate(
     *,
     calibration_sha256: str,
     implementation_revision: str,
-    candidate: Literal["nvfp4-w4a4", "nvfp4-w4a16"],
+    candidate: Literal[
+        "nvfp4-w4a4",
+        "nvfp4-w4a16",
+        "nvfp4-w4a16-protection-ablation",
+        "w8a16-critical-high",
+    ],
     max_calibration_samples: int = 128,
     max_calibration_length: int = 1024,
 ) -> dict[str, Any]:
@@ -1021,6 +1107,10 @@ def _attention_ignore(base_model_prefix: str) -> str:
     )
 
 
+def _attention_value_ignore(base_model_prefix: str) -> str:
+    return rf"re:^{re.escape(base_model_prefix)}\.blocks\.\d+\.att\.value$"
+
+
 def _require_module(
     parent: torch.nn.Module,
     name: str,
@@ -1047,7 +1137,7 @@ def _validate_policy_inputs(
     resolved_targets: set[str],
     ignore: list[str],
     kv_cache_enabled: bool,
-    attention_ignore: str,
+    required_ignore: list[str],
 ) -> None:
     if resolved_targets != {"Linear"}:
         raise ValueError(
@@ -1060,7 +1150,7 @@ def _validate_policy_inputs(
             "uses recurrent WKV state instead of a transformer KV cache."
         )
 
-    allowed_ignore = {attention_ignore, _HEAD_IGNORE}
+    allowed_ignore = set(required_ignore)
     unsupported_ignore = sorted(set(ignore) - allowed_ignore)
     if unsupported_ignore:
         raise ValueError(
@@ -1074,6 +1164,9 @@ def apply_rwkv7_target_policy(
     resolved_targets: set[str],
     ignore: list[str],
     kv_cache_enabled: bool,
+    protection_profile: Literal["critical-high", "v-first-dataflow"] = (
+        "critical-high"
+    ),
 ) -> tuple[list[str], QuantizationTargetPolicyMetadata]:
     """Validate standard RWKV-7 structure and select only ChannelMix linears.
 
@@ -1084,11 +1177,20 @@ def apply_rwkv7_target_policy(
 
     base_model_prefix, base_model = _resolve_standard_base_model(model)
     attention_ignore = _attention_ignore(base_model_prefix)
+    attention_value_ignore = _attention_value_ignore(base_model_prefix)
+    if protection_profile == "critical-high":
+        required_ignore = [attention_ignore, _HEAD_IGNORE]
+    elif protection_profile == "v-first-dataflow":
+        required_ignore = [attention_value_ignore, _HEAD_IGNORE]
+    else:
+        raise ValueError(
+            f"unsupported RWKV-7 protection profile: {protection_profile}"
+        )
     _validate_policy_inputs(
         resolved_targets,
         ignore,
         kv_cache_enabled,
-        attention_ignore,
+        required_ignore,
     )
     config = model.config
     blocks = _require_module(
@@ -1177,66 +1279,77 @@ def apply_rwkv7_target_policy(
             f"missing={missing}, unexpected={unexpected}."
         )
 
-    policy_ignore = list(dict.fromkeys([*ignore, attention_ignore, _HEAD_IGNORE]))
-    metadata = QuantizationTargetPolicyMetadata(
-        base_model_prefix=base_model_prefix,
-        selection=QuantizationTargetPolicyDecision(
+    if protection_profile == "v-first-dataflow":
+        selected_modules.extend(other_time_mix_modules)
+
+    policy_ignore = list(dict.fromkeys([*ignore, *required_ignore]))
+    protections = [
+        QuantizationTargetPolicyDecision(
             kind="module",
-            names=selected_modules,
+            names=first_value_module,
             reason=(
-                "Select only standard RWKV-7 ChannelMix key/value projections; "
-                "they are outside the recurrent TimeMix and v_first dataflow."
+                "Layer-0 TimeMix value projection produces v_first, which is "
+                "consumed by every later RWKV-7 block."
             ),
         ),
-        protections=[
-            QuantizationTargetPolicyDecision(
-                kind="module",
-                names=first_value_module,
-                reason=(
-                    "Layer-0 TimeMix value projection produces v_first, which is "
-                    "consumed by every later RWKV-7 block."
-                ),
+        QuantizationTargetPolicyDecision(
+            kind="module",
+            names=later_value_modules,
+            reason=(
+                "Later TimeMix value projections are blended with v_first before "
+                "entering recurrent WKV state updates."
             ),
-            QuantizationTargetPolicyDecision(
-                kind="module",
-                names=later_value_modules,
-                reason=(
-                    "Later TimeMix value projections are blended with v_first "
-                    "before entering recurrent WKV state updates."
-                ),
+        ),
+        QuantizationTargetPolicyDecision(
+            kind="tensor",
+            names=later_value_tensors,
+            reason=(
+                "The v0/v1/v2 tensors gate every later layer's dependency on "
+                "v_first and remain high precision in every candidate."
             ),
-            QuantizationTargetPolicyDecision(
-                kind="tensor",
-                names=later_value_tensors,
-                reason=(
-                    "The v0/v1/v2 tensors gate every later layer's dependency on "
-                    "v_first and are not Linear module targets."
-                ),
-            ),
+        ),
+    ]
+    if protection_profile == "critical-high":
+        protections.append(
             QuantizationTargetPolicyDecision(
                 kind="module",
                 names=other_time_mix_modules,
                 reason=(
-                    "Keep the remaining TimeMix projections out of this minimal "
-                    "policy because they feed recurrent WKV and local attention."
+                    "Keep the remaining TimeMix projections high precision in "
+                    "the critical-high candidate."
                 ),
-            ),
+            )
+        )
+    protections.extend(
+        [
             QuantizationTargetPolicyDecision(
                 kind="module",
                 names=[_HEAD_IGNORE],
-                reason=(
-                    "Keep the output head unquantized so this initial policy only "
-                    "changes repeated ChannelMix projections."
-                ),
+                reason="Keep the output head high precision in every candidate.",
             ),
             QuantizationTargetPolicyDecision(
                 kind="tensor",
                 names=recurrent_time_mix_tensors,
                 reason=(
-                    "Protect the standard TimeMix parameters that control recurrent "
-                    "WKV state, receptance, decay, key, value, and gating."
+                    "Keep the standard raw TimeMix low-rank/recurrent parameters "
+                    "high precision until the standard Transformers and vLLM "
+                    "loaders expose a compressed parameter contract."
                 ),
             ),
-        ],
+        ]
+    )
+    metadata = QuantizationTargetPolicyMetadata(
+        protection_profile=protection_profile,
+        base_model_prefix=base_model_prefix,
+        selection=QuantizationTargetPolicyDecision(
+            kind="module",
+            names=selected_modules,
+            reason=(
+                "Select standard RWKV-7 ChannelMix projections and, for the "
+                "v-first-dataflow ablation only, non-value TimeMix projections; "
+                "the complete v_first value path remains high precision."
+            ),
+        ),
+        protections=protections,
     )
     return policy_ignore, metadata

@@ -25,7 +25,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--candidate",
-        choices=("nvfp4-w4a4", "nvfp4-w4a16"),
+        choices=(
+            "nvfp4-w4a4",
+            "nvfp4-w4a16",
+            "nvfp4-w4a16-protection-ablation",
+            "w8a16-critical-high",
+        ),
         required=True,
     )
     parser.add_argument("--max-calibration-samples", type=int, default=128)

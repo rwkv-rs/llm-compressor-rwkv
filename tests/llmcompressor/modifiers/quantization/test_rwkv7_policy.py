@@ -256,30 +256,123 @@ def _tiny_standard_rwkv7():
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    ("candidate", "input_dtype", "input_scale"),
+    (
+        "candidate",
+        "algorithm",
+        "weight_dtype",
+        "weight_group_size",
+        "input_dtype",
+        "input_scale",
+        "protection_profile",
+    ),
     [
-        ("nvfp4-w4a4", "float4", "dynamic_local"),
-        ("nvfp4-w4a16", "float16", "none"),
+        (
+            "nvfp4-w4a4",
+            "NVFP4",
+            "float4",
+            16,
+            "float4",
+            "dynamic_local",
+            "critical-high",
+        ),
+        (
+            "nvfp4-w4a16",
+            "NVFP4",
+            "float4",
+            16,
+            "float16",
+            "none",
+            "critical-high",
+        ),
+        (
+            "nvfp4-w4a16-protection-ablation",
+            "NVFP4",
+            "float4",
+            16,
+            "float16",
+            "none",
+            "v-first-dataflow",
+        ),
+        (
+            "w8a16-critical-high",
+            "INT8",
+            "int8",
+            128,
+            "float16",
+            "none",
+            "critical-high",
+        ),
     ],
 )
-def test_tiny_standard_rwkv7_builds_closed_nvfp4_recipe(
-    candidate, input_dtype, input_scale, real_rwkv7_types
+def test_tiny_standard_rwkv7_builds_closed_candidate_recipe(
+    candidate,
+    algorithm,
+    weight_dtype,
+    weight_group_size,
+    input_dtype,
+    input_scale,
+    protection_profile,
+    real_rwkv7_types,
 ):
     model = _tiny_standard_rwkv7()
 
     modifier = build_rwkv7_quantization_recipe(model, candidate)
     loader = modifier.target_policy_metadata.recipe
 
-    assert loader.candidate_order == ["nvfp4-w4a4", "nvfp4-w4a16"]
-    assert loader.algorithm == "NVFP4"
-    assert loader.weight_dtype == "float4"
-    assert loader.weight_group_size == 16
-    assert loader.weight_scale_dtype == "float8_e4m3fn"
+    assert loader.candidate_order == [
+        "nvfp4-w4a4",
+        "nvfp4-w4a16",
+        "nvfp4-w4a16-protection-ablation",
+        "w8a16-critical-high",
+    ]
+    assert loader.algorithm == algorithm
+    assert loader.weight_dtype == weight_dtype
+    assert loader.weight_group_size == weight_group_size
     assert loader.input_dtype == input_dtype
     assert loader.input_scale == input_scale
+    assert loader.protection_profile == protection_profile
+    assert modifier.target_policy_metadata.protection_profile == protection_profile
     assert loader.targets == modifier.target_policy_metadata.selection.names
     assert loader.quantization_applied is False
     assert not any(hasattr(module, "quantization_scheme") for module in model.modules())
+
+
+@pytest.mark.unit
+def test_protection_ablation_quantizes_non_value_timemix_but_keeps_v_first(
+    real_rwkv7_types,
+):
+    modifier = build_rwkv7_quantization_recipe(
+        _tiny_standard_rwkv7(), "nvfp4-w4a16-protection-ablation"
+    )
+    metadata = modifier.target_policy_metadata
+
+    assert modifier.ignore == [
+        r"re:^model\.blocks\.\d+\.att\.value$",
+        "head",
+    ]
+    assert "model.blocks.0.att.value" not in metadata.selection.names
+    assert "model.blocks.1.att.value" not in metadata.selection.names
+    assert "model.blocks.0.att.receptance" in metadata.selection.names
+    assert "model.blocks.1.att.output" in metadata.selection.names
+    protected_modules = {
+        name
+        for decision in metadata.protections
+        if decision.kind == "module"
+        for name in decision.names
+    }
+    assert {
+        "model.blocks.0.att.value",
+        "model.blocks.1.att.value",
+        "head",
+    } <= protected_modules
+    protected_tensors = {
+        name
+        for decision in metadata.protections
+        if decision.kind == "tensor"
+        for name in decision.names
+    }
+    assert "model.blocks.1.att.v0" in protected_tensors
+    assert "model.blocks.1.att.v2" in protected_tensors
 
 
 @pytest.mark.unit

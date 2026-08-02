@@ -56,6 +56,8 @@ class QuantizationModifier(Modifier, QuantizationMixin):
     :param target_policy: optional model-specific fail-closed module targeting policy.
         ``rwkv7`` selects only the standard ChannelMix projections and records its
         recurrent TimeMix and v_first protections in recipe metadata.
+    :param target_policy_profile: protection profile used by ``rwkv7``. The explicit
+        ``v-first-dataflow`` ablation never unprotects the v_first dataflow.
     """
 
     def on_initialize(self, state: State, **kwargs) -> bool:
