@@ -236,6 +236,108 @@ def test_rwkv7_transformers_provenance_delegates_operator_gate(monkeypatch):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "repository",
+    [
+        "https://github.com/rwkv-rs/transformers-rwkv",
+        "https://github.com/rwkv-rs/transformers-rwkv.git",
+        "https://github.com/rwkv-rs/transformers-rwkv/",
+        "git+https://github.com/rwkv-rs/transformers-rwkv.git/",
+        "HTTPS://GITHUB.COM/RWKV-RS/TRANSFORMERS-RWKV.GIT/",
+    ],
+    ids=["plain", "git-suffix", "trailing-slash", "git-plus", "url-case"],
+)
+def test_rwkv7_repository_canonicalizer_accepts_exact_https_variants(repository):
+    assert rwkv7_module._canonical_repository_url(repository) == (
+        "https://github.com/rwkv-rs/transformers-rwkv"
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "repository",
+    [
+        " https://github.com/rwkv-rs/transformers-rwkv.git",
+        "https://github.com/rwkv-rs/transformers-rwkv.git ",
+        "https://github.com/rwkv-rs/transformers-rwkv.git\n",
+        "https://github.com/rwkv-rs/transformers-rwkv.git\x1f",
+        "https://github.com/rwkv-rs/transformers-rwkv.git\x7f",
+        "https://githu\N{CYRILLIC SMALL LETTER VE}.com/rwkv-rs/transformers-rwkv.git",
+        "https://github.com/%72wkv-rs/transformers-rwkv.git",
+        "http://github.com/rwkv-rs/transformers-rwkv.git",
+        "ssh://git@github.com/rwkv-rs/transformers-rwkv.git",
+        "https://user@github.com/rwkv-rs/transformers-rwkv.git",
+        "https://github.com:443/rwkv-rs/transformers-rwkv.git",
+        "https://github.com/rwkv-rs/transformers-rwkv.git?ref=main",
+        "https://github.com/rwkv-rs/transformers-rwkv.git#main",
+        "https://github.example/rwkv-rs/transformers-rwkv.git",
+        "https://github.com/attacker/transformers-rwkv.git",
+        "https://github.com/rwkv-rs//transformers-rwkv.git",
+        "https://github.com/rwkv-rs/transformers-rwkv.git.git",
+        "https://github.com/rwkv-rs/transformers-rwkv.git//",
+        "https://github.com/rwkv-rs/transformers-rwkv.git;ref=main",
+    ],
+    ids=[
+        "leading-space",
+        "trailing-space",
+        "trailing-newline",
+        "control",
+        "delete",
+        "unicode-host",
+        "percent-encoding",
+        "http",
+        "ssh",
+        "userinfo",
+        "port",
+        "query",
+        "fragment",
+        "foreign-host",
+        "fork",
+        "repeated-path-slash",
+        "double-git-suffix",
+        "double-trailing-slash",
+        "parameters",
+    ],
+)
+def test_rwkv7_transformers_pep610_rejects_hostile_repository(
+    monkeypatch,
+    repository,
+):
+    import transformers
+
+    class _VcsDistribution:
+        @staticmethod
+        def read_text(filename):
+            assert filename == "direct_url.json"
+            return json.dumps(
+                {
+                    "url": repository,
+                    "vcs_info": {
+                        "vcs": "git",
+                        "requested_revision": (
+                            "2696927df9363b5fa175076bb827ba4da2c4e581"
+                        ),
+                        "commit_id": "2696927df9363b5fa175076bb827ba4da2c4e581",
+                    },
+                }
+            )
+
+        @staticmethod
+        def locate_file(filename):
+            assert filename == "transformers/__init__.py"
+            return transformers.__file__
+
+    monkeypatch.setattr(
+        rwkv7_module.importlib_metadata,
+        "distribution",
+        lambda name: _VcsDistribution(),
+    )
+
+    with pytest.raises(RuntimeError, match="RWKV-7 repository URL"):
+        validate_rwkv7_transformers_provenance()
+
+
+@pytest.mark.unit
 def test_rwkv7_transformers_provenance_propagates_operator_failure(monkeypatch):
     monkeypatch.setattr(
         rwkv7_module,

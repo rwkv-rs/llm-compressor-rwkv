@@ -113,6 +113,13 @@ _LLM_COMPRESSOR_UPSTREAM_OID = "28c9c76b74cdd47076f95d012227482d22a8f365"
 _LLM_COMPRESSOR_FORK_REPOSITORY = "https://github.com/rwkv-rs/llm-compressor-rwkv.git"
 _TRANSFORMERS_RWKV_REPOSITORY = "https://github.com/rwkv-rs/transformers-rwkv.git"
 _TRANSFORMERS_RWKV_OID = "2696927df9363b5fa175076bb827ba4da2c4e581"
+_RWKV7_CANONICAL_REPOSITORIES = frozenset(
+    {
+        "vllm-project/llm-compressor",
+        "rwkv-rs/llm-compressor-rwkv",
+        "rwkv-rs/transformers-rwkv",
+    }
+)
 _VLLM_RWKV_NVFP4_W4A16_CONSUMER_REVISION = "88b992bbc73e8b904ae672dfd39396b6dd0d6ea4"
 _TRANSFORMERS_RWKV_CONSUMER = "transformers-rwkv-compressed-tensors"
 _VLLM_RWKV_NVFP4_W4A4_CONSUMER = "vllm-rwkv-nvfp4-w4a4"
@@ -302,14 +309,59 @@ def _normalize_operator_runtime_provenance(
 
 
 def _canonical_repository_url(repository: str) -> str:
-    normalized = repository.strip().removeprefix("git+").rstrip("/")
-    if normalized.startswith("git@github.com:"):
-        normalized = f"https://github.com/{normalized.removeprefix('git@github.com:')}"
-    elif normalized.startswith("ssh://git@github.com/"):
-        normalized = (
-            f"https://github.com/{normalized.removeprefix('ssh://git@github.com/')}"
+    if not isinstance(repository, str) or not repository:
+        raise RuntimeError("RWKV-7 repository URL must be a non-empty string")
+    if any(
+        ord(character) <= 0x20 or ord(character) >= 0x7F for character in repository
+    ):
+        raise RuntimeError(
+            "RWKV-7 repository URL must contain only visible ASCII characters"
         )
-    return normalized.removesuffix(".git")
+    if "%" in repository:
+        raise RuntimeError("RWKV-7 repository URL must not contain percent encoding")
+
+    normalized = repository.removeprefix("git+")
+    parsed = urlparse(normalized)
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise RuntimeError("RWKV-7 repository URL has an invalid port") from error
+    if parsed.scheme.lower() != "https":
+        raise RuntimeError("RWKV-7 repository URL must use HTTPS")
+    if parsed.username is not None or parsed.password is not None:
+        raise RuntimeError("RWKV-7 repository URL must not contain userinfo")
+    if port is not None or parsed.netloc.lower() != "github.com":
+        raise RuntimeError("RWKV-7 repository URL must use github.com without a port")
+    if parsed.params or parsed.query or parsed.fragment:
+        raise RuntimeError(
+            "RWKV-7 repository URL must not contain parameters, query, or fragment"
+        )
+    if "//" in parsed.path:
+        raise RuntimeError("RWKV-7 repository URL must not contain repeated slashes")
+
+    path = parsed.path[:-1] if parsed.path.endswith("/") else parsed.path
+    parts = path.removeprefix("/").split("/")
+    if len(parts) != 2 or not all(parts):
+        raise RuntimeError(
+            "RWKV-7 repository URL must contain exactly one owner and repository"
+        )
+    owner, name = parts
+    if name.lower().endswith(".git"):
+        name = name[:-4]
+        if name.lower().endswith(".git"):
+            raise RuntimeError(
+                "RWKV-7 repository URL must contain at most one .git suffix"
+            )
+    github_name = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
+    if github_name.fullmatch(owner) is None or github_name.fullmatch(name) is None:
+        raise RuntimeError("RWKV-7 repository URL contains an invalid GitHub path")
+
+    canonical_path = f"{owner.lower()}/{name.lower()}"
+    if canonical_path not in _RWKV7_CANONICAL_REPOSITORIES:
+        raise RuntimeError(
+            "RWKV-7 repository URL is not one of the exact contract repositories"
+        )
+    return f"https://github.com/{canonical_path}"
 
 
 def _git_provenance_value(repository_root: Path, *arguments: str) -> str:
