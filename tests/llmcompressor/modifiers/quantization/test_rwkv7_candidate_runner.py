@@ -20,6 +20,9 @@ from llmcompressor.modifiers.quantization.rwkv7 import (
     _fresh_reload_generate_script,
     _load_calibration_records,
     _prepare_standard_rwkv7_checkpoint,
+    _validate_native_rwkv7_config,
+    _validate_native_rwkv7_runtime,
+    _validate_rwkv7_loading_info,
     audit_rwkv7_quantized_checkpoint,
     build_rwkv7_artifact_contract,
     build_rwkv7_quantization_recipe,
@@ -678,7 +681,7 @@ def standard_linear_w8_artifact(tmp_path, monkeypatch):
     fresh_reload_script = _fresh_reload_generate_script()
     assert "rwkv7_low_rank_w8" not in fresh_reload_script
     assert "output_loading_info=True" in fresh_reload_script
-    assert "quantized_weight_names" in fresh_reload_script
+    assert "_validate_rwkv7_loading_info(loading_info)" in fresh_reload_script
     with torch.no_grad():
         for index, name in enumerate(low_rank_modules, start=1):
             model.get_submodule(name).weight.uniform_(
@@ -727,6 +730,7 @@ def standard_linear_w8_artifact(tmp_path, monkeypatch):
     assert audit["targets"] == contract.vllm.quantized_modules
     assert audit["quantized_weight_names"] == contract.vllm.quantized_weight_names
     assert audit["legacy_weight_aliases"] == []
+    assert audit["tensor_count"] == audit["expected_tensor_count"]
     assert audit["transformers_provenance"] == _runtime_provenance().model_dump(
         mode="json"
     )
@@ -818,6 +822,179 @@ def test_audit_rejects_missing_protected_normalization_bias_before_runtime(
             contract.vllm.quantized_modules,
             contract.candidate,
         )
+
+
+@pytest.mark.integration
+def test_audit_rejects_unexpected_physical_tensor(
+    standard_linear_w8_artifact,
+):
+    from safetensors.torch import load_file, save_file
+
+    artifact_path, contract, _ = standard_linear_w8_artifact
+    shard = artifact_path / "model.safetensors"
+    tensors = load_file(shard)
+    tensors["model.unowned_extra"] = torch.zeros(1)
+    save_file(tensors, shard)
+
+    with pytest.raises(RuntimeError, match="exact artifact contract"):
+        audit_rwkv7_quantized_checkpoint(
+            artifact_path,
+            contract.vllm.quantized_modules,
+            contract.candidate,
+        )
+
+
+@pytest.mark.integration
+def test_audit_rejects_legacy_logical_weight_alias(
+    standard_linear_w8_artifact,
+):
+    from safetensors.torch import load_file, save_file
+
+    artifact_path, contract, _ = standard_linear_w8_artifact
+    shard = artifact_path / "model.safetensors"
+    tensors = load_file(shard)
+    target = contract.vllm.quantized_modules[0]
+    tensors[f"{target}.weight"] = torch.zeros(1)
+    save_file(tensors, shard)
+
+    with pytest.raises(RuntimeError, match="legacy raw weight aliases"):
+        audit_rwkv7_quantized_checkpoint(
+            artifact_path,
+            contract.vllm.quantized_modules,
+            contract.candidate,
+        )
+
+
+@pytest.mark.integration
+def test_audit_rejects_missing_packed_tensor(standard_linear_w8_artifact):
+    from safetensors.torch import load_file, save_file
+
+    artifact_path, contract, _ = standard_linear_w8_artifact
+    shard = artifact_path / "model.safetensors"
+    tensors = load_file(shard)
+    tensors.pop(f"{contract.vllm.quantized_modules[0]}.weight_scale")
+    save_file(tensors, shard)
+
+    with pytest.raises(RuntimeError, match="compressed tensor inventory drifted"):
+        audit_rwkv7_quantized_checkpoint(
+            artifact_path,
+            contract.vllm.quantized_modules,
+            contract.candidate,
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("path", "replacement"),
+    [
+        (("targets",), ["model.blocks.0.ffn.key"]),
+        (("weights", "symmetric"), False),
+        (("weights", "num_bits"), 4),
+        (("input_activations",), {"dynamic": "local"}),
+    ],
+    ids=["targets", "symmetric", "bits", "unexpected-input-args"],
+)
+def test_audit_rejects_serialized_config_group_drift(
+    standard_linear_w8_artifact,
+    path,
+    replacement,
+):
+    artifact_path, contract, _ = standard_linear_w8_artifact
+    config_path = artifact_path / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    value = config["quantization_config"]["config_groups"]["group_0"]
+    for key in path[:-1]:
+        value = value[key]
+    value[path[-1]] = replacement
+    config_path.write_text(
+        json.dumps(config, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="quantization config group differs"):
+        audit_rwkv7_quantized_checkpoint(
+            artifact_path,
+            contract.vllm.quantized_modules,
+            contract.candidate,
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("field", "replacement", "error_match"),
+    [
+        ("model_type", "rwkv", "model_type"),
+        ("architectures", ["AutoModelForCausalLM"], "architectures"),
+        (
+            "auto_map",
+            {"AutoConfig": "configuration_rwkv7.Rwkv7Config"},
+            "without auto_map",
+        ),
+    ],
+    ids=["model-type", "architectures", "auto-map"],
+)
+def test_audit_rejects_native_config_schema_drift(
+    standard_linear_w8_artifact,
+    field,
+    replacement,
+    error_match,
+):
+    artifact_path, contract, _ = standard_linear_w8_artifact
+    config_path = artifact_path / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config[field] = replacement
+    config_path.write_text(
+        json.dumps(config, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match=error_match):
+        audit_rwkv7_quantized_checkpoint(
+            artifact_path,
+            contract.vllm.quantized_modules,
+            contract.candidate,
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("missing_keys", ["model.blocks.0.ln1.bias"]),
+        ("unexpected_keys", ["model.unexpected.weight"]),
+        (
+            "mismatched_keys",
+            [("model.blocks.0.ln1.weight", [8], [16])],
+        ),
+    ],
+    ids=["protected-missing", "unexpected", "mismatched"],
+)
+def test_public_loader_rejects_all_state_dict_key_drift(field, value):
+    loading_info = {
+        "missing_keys": [],
+        "unexpected_keys": [],
+        "mismatched_keys": [],
+        "error_msgs": [],
+    }
+    _validate_rwkv7_loading_info(loading_info)
+    loading_info[field] = value
+
+    with pytest.raises(RuntimeError, match=f"non-empty {field}"):
+        _validate_rwkv7_loading_info(loading_info)
+
+
+@pytest.mark.unit
+def test_native_runtime_rejects_non_native_config_or_model():
+    model = _tiny_standard_rwkv7()
+    serialized_config = model.config.to_dict()
+    serialized_config["architectures"] = ["Rwkv7ForCausalLM"]
+    _validate_native_rwkv7_config(serialized_config)
+    _validate_native_rwkv7_runtime(model.config, model)
+
+    with pytest.raises(RuntimeError, match="native Transformers Rwkv7Config"):
+        _validate_native_rwkv7_runtime(SimpleNamespace(), model)
+    with pytest.raises(RuntimeError, match="native Transformers Rwkv7ForCausalLM"):
+        _validate_native_rwkv7_runtime(model.config, torch.nn.Linear(1, 1))
 
 
 @pytest.mark.unit

@@ -1233,42 +1233,15 @@ def _validate_candidate_scheme(
     framework_versions: dict[str, str],
     runtime_provenance: RWKV7TransformersProvenance,
 ) -> RWKV7QuantizationRecipeMetadata:
-    weights = scheme.weights
     inputs = scheme.input_activations
-    expected_inputs = candidate == "nvfp4-w4a4"
     is_w8 = candidate == "w8a16-low-rank-critical-high"
-    if is_w8:
-        valid_weights = (
-            weights is not None
-            and weights.num_bits == 8
-            and str(weights.type) == "int"
-            and str(weights.strategy) == "group"
-            and weights.group_size == 32
-            and weights.symmetric is True
-        )
-    else:
-        valid_weights = (
-            weights is not None
-            and weights.num_bits == 4
-            and str(weights.type) == "float"
-            and str(weights.strategy) == "tensor_group"
-            and weights.group_size == 16
-            and str(weights.scale_dtype) == "torch.float8_e4m3fn"
-        )
-    valid_inputs = (inputs is not None) == expected_inputs
-    if inputs is not None:
-        valid_inputs = valid_inputs and (
-            inputs.num_bits == 4
-            and str(inputs.type) == "float"
-            and str(inputs.strategy) == "tensor_group"
-            and inputs.group_size == 16
-            and str(inputs.dynamic) == "local"
-            and str(inputs.scale_dtype) == "torch.float8_e4m3fn"
-        )
-    if not valid_weights or not valid_inputs:
+    actual_group = scheme.model_dump(mode="json")
+    expected_group = _expected_quantization_group(candidate, serialized=False)
+    if actual_group != expected_group:
         raise RuntimeError(
             "compressed-tensors scheme "
-            f"{_CANDIDATE_SCHEMES[candidate]} drifted from RWKV-7 contract"
+            f"{_CANDIDATE_SCHEMES[candidate]} drifted from the exact RWKV-7 "
+            f"config group: expected={expected_group} actual={actual_group}"
         )
 
     return RWKV7QuantizationRecipeMetadata(
@@ -1368,6 +1341,144 @@ def _load_rwkv7_artifact_contract(output_dir: Path) -> RWKV7ArtifactContract:
         ) from error
 
 
+def _expected_quantization_args(candidate: str) -> dict[str, Any]:
+    if candidate == "w8a16-low-rank-critical-high":
+        return {
+            "actorder": None,
+            "block_structure": None,
+            "dynamic": False,
+            "group_size": 32,
+            "num_bits": 8,
+            "observer": "memoryless_minmax",
+            "observer_kwargs": {},
+            "scale_dtype": None,
+            "strategy": "group",
+            "symmetric": True,
+            "type": "int",
+            "zp_dtype": None,
+        }
+    return {
+        "actorder": None,
+        "block_structure": None,
+        "dynamic": False,
+        "group_size": 16,
+        "num_bits": 4,
+        "observer": "memoryless_minmax",
+        "observer_kwargs": {},
+        "scale_dtype": "torch.float8_e4m3fn",
+        "strategy": "tensor_group",
+        "symmetric": True,
+        "type": "float",
+        "zp_dtype": None,
+    }
+
+
+def _expected_input_quantization_args(candidate: str) -> dict[str, Any] | None:
+    if candidate != "nvfp4-w4a4":
+        return None
+    return {
+        "actorder": None,
+        "block_structure": None,
+        "dynamic": "local",
+        "group_size": 16,
+        "num_bits": 4,
+        "observer": "static_minmax",
+        "observer_kwargs": {},
+        "scale_dtype": "torch.float8_e4m3fn",
+        "strategy": "tensor_group",
+        "symmetric": True,
+        "type": "float",
+        "zp_dtype": None,
+    }
+
+
+def _expected_quantization_group(
+    candidate: str,
+    *,
+    serialized: bool,
+) -> dict[str, Any]:
+    expected_format = (
+        "pack-quantized"
+        if candidate == "w8a16-low-rank-critical-high"
+        else "nvfp4-pack-quantized"
+    )
+    return {
+        "format": expected_format if serialized else None,
+        "input_activations": _expected_input_quantization_args(candidate),
+        "output_activations": None,
+        "targets": ["Linear"],
+        "weights": _expected_quantization_args(candidate),
+    }
+
+
+def _validate_native_rwkv7_config(serialized_config: Mapping[str, Any]) -> None:
+    if serialized_config.get("model_type") != "rwkv7":
+        raise RuntimeError("RWKV-7 artifact model_type must be exactly 'rwkv7'")
+    if serialized_config.get("architectures") != ["Rwkv7ForCausalLM"]:
+        raise RuntimeError(
+            "RWKV-7 artifact architectures must be exactly ['Rwkv7ForCausalLM']"
+        )
+    if "auto_map" in serialized_config:
+        raise RuntimeError(
+            "RWKV-7 artifact must use native Transformers classes without auto_map"
+        )
+
+
+def _validate_native_rwkv7_runtime(config: Any, model: torch.nn.Module) -> None:
+    from transformers import Rwkv7Config
+    from transformers.models.rwkv7 import Rwkv7ForCausalLM
+
+    if type(config) is not Rwkv7Config:
+        raise RuntimeError(
+            "RWKV-7 public load did not resolve the native Transformers Rwkv7Config"
+        )
+    if type(model) is not Rwkv7ForCausalLM:
+        raise RuntimeError(
+            "RWKV-7 public load did not resolve the native Transformers "
+            "Rwkv7ForCausalLM"
+        )
+
+
+def _validate_rwkv7_loading_info(loading_info: Mapping[str, Any]) -> None:
+    if not isinstance(loading_info, Mapping):
+        raise RuntimeError("RWKV-7 public loader did not return loading information")
+    for field in (
+        "missing_keys",
+        "unexpected_keys",
+        "mismatched_keys",
+        "error_msgs",
+    ):
+        values = loading_info.get(field)
+        if not isinstance(values, (list, tuple, set, frozenset)):
+            raise RuntimeError(
+                f"RWKV-7 public loader returned invalid {field}: {values!r}"
+            )
+        if values:
+            raise RuntimeError(
+                f"RWKV-7 public loader returned non-empty {field}: {list(values)!r}"
+            )
+
+
+def _expected_physical_tensor_keys(
+    contract: RWKV7ArtifactContract,
+) -> set[str]:
+    expected = set(contract.vllm.protected_parameter_keys)
+    for target in contract.vllm.quantized_modules:
+        expected.update(
+            {
+                f"{target}.weight_packed",
+                f"{target}.weight_scale",
+            }
+        )
+        if contract.candidate == "w8a16-low-rank-critical-high":
+            expected.add(f"{target}.weight_shape")
+        else:
+            expected.add(f"{target}.weight_global_scale")
+            if contract.candidate == "nvfp4-w4a4":
+                expected.add(f"{target}.input_global_scale")
+    return expected
+
+
 def _tensor_owners(tensors: dict[str, tuple[list[int], str]], suffix: str) -> set[str]:
     return {name.removesuffix(suffix) for name in tensors if name.endswith(suffix)}
 
@@ -1385,6 +1496,7 @@ def audit_rwkv7_quantized_checkpoint(
         raise ValueError("RWKV-7 audit targets must be non-empty and unique")
 
     config = json.loads((output_dir / "config.json").read_text(encoding="utf-8"))
+    _validate_native_rwkv7_config(config)
     quantization = config.get("quantization_config", {})
     loaded_contract = _load_rwkv7_artifact_contract(output_dir)
     if artifact_contract is not None and loaded_contract != artifact_contract:
@@ -1423,6 +1535,12 @@ def audit_rwkv7_quantized_checkpoint(
     if not isinstance(groups, dict) or len(groups) != 1:
         raise RuntimeError("RWKV-7 checkpoint has an invalid quantization config group")
     group = next(iter(groups.values()))
+    expected_group = _expected_quantization_group(candidate, serialized=True)
+    if group != expected_group:
+        raise RuntimeError(
+            "RWKV-7 serialized quantization config group differs from the exact "
+            f"candidate contract: expected={expected_group} actual={group}"
+        )
     input_quantized = group.get("input_activations") is not None
     if input_quantized != (candidate == "nvfp4-w4a4"):
         raise RuntimeError(
@@ -1466,7 +1584,9 @@ def audit_rwkv7_quantized_checkpoint(
                 f"suffix={suffix} expected={sorted(expected_owners)} "
                 f"actual={sorted(actual_owners)}"
             )
-    legacy_weight_aliases = sorted(set(expected_targets) & tensors.keys())
+    legacy_weight_aliases = sorted(
+        {f"{target}.weight" for target in expected_targets} & tensors.keys()
+    )
     if legacy_weight_aliases:
         raise RuntimeError(
             "RWKV-7 artifact contains legacy raw weight aliases: "
@@ -1523,12 +1643,23 @@ def audit_rwkv7_quantized_checkpoint(
     for name in loaded_contract.vllm.protected_tensors:
         if any(key.startswith(f"{name}_") for key in tensors):
             raise RuntimeError(f"RWKV-7 protected tensor was transformed: {name}")
+    expected_tensor_keys = _expected_physical_tensor_keys(loaded_contract)
+    actual_tensor_keys = set(tensors)
+    missing_tensor_keys = sorted(expected_tensor_keys - actual_tensor_keys)
+    unexpected_tensor_keys = sorted(actual_tensor_keys - expected_tensor_keys)
+    if missing_tensor_keys or unexpected_tensor_keys:
+        raise RuntimeError(
+            "RWKV-7 physical safetensors key set differs from the exact artifact "
+            f"contract: missing={missing_tensor_keys} "
+            f"unexpected={unexpected_tensor_keys}"
+        )
     return {
         "format": expected_format,
         "targets": expected_targets,
         "quantized_weight_names": [f"{name}.weight" for name in expected_targets],
         "protected_parameter_count": len(protected_names),
         "tensor_count": len(tensors),
+        "expected_tensor_count": len(expected_tensor_keys),
         "input_quantized": input_quantized,
         "artifact_contract_serialized": True,
         "transformers_provenance": transformers_provenance.model_dump(mode="json"),
@@ -1561,11 +1692,19 @@ import json, math, statistics, sys, time, torch
 from llmcompressor.modifiers.quantization.rwkv7 import (
     RWKV7ArtifactContract,
     RWKV7RepositoryContract,
+    _validate_native_rwkv7_config,
+    _validate_native_rwkv7_runtime,
+    _validate_rwkv7_loading_info,
     validate_rwkv7_transformers_provenance,
 )
 
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(f'RWKV-7 fresh reload contract failed: {message}')
+
 with open(f'{sys.argv[1]}/config.json', encoding='utf-8') as config_handle:
     serialized_config = json.load(config_handle)
+_validate_native_rwkv7_config(serialized_config)
 serialized_contract = serialized_config['rwkv7_quantization_metadata']
 contract_model = RWKV7ArtifactContract.model_validate(serialized_contract)
 transformers_provenance = validate_rwkv7_transformers_provenance(
@@ -1581,31 +1720,55 @@ contract = contract_model.model_dump(mode='json')
 from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.utils.quantization_config import CompressedTensorsConfig
 
-config = AutoConfig.from_pretrained(sys.argv[1])
+config = AutoConfig.from_pretrained(sys.argv[1], trust_remote_code=False)
 generate_seed = int(sys.argv[2])
 prompt_ids = json.loads(sys.argv[3])
 max_new_tokens = int(sys.argv[4])
 warmup_runs = int(sys.argv[5])
 timed_runs = int(sys.argv[6])
 runtime_dtype = config.dtype
-assert isinstance(runtime_dtype, torch.dtype)
-assert warmup_runs >= 1
-assert timed_runs >= 1
-assert getattr(config, 'rwkv7_quantization_metadata') == contract
-assert contract['schema_version'] == 3
-assert contract['candidate'] in (
-    'nvfp4-w4a4',
-    'nvfp4-w4a16',
-    'nvfp4-w4a16-protection-ablation',
-    'w8a16-low-rank-critical-high',
+require(isinstance(runtime_dtype, torch.dtype), 'config dtype is not torch.dtype')
+require(warmup_runs >= 1, 'warmup_runs must be at least one')
+require(timed_runs >= 1, 'timed_runs must be at least one')
+require(
+    getattr(config, 'rwkv7_quantization_metadata', None) == contract,
+    'AutoConfig metadata differs from the serialized artifact contract',
 )
-assert contract['vllm']['architecture'] == 'Rwkv7ForCausalLM'
-assert contract['vllm']['source_format'] == 'standard_hf'
-assert contract['vllm']['legacy_pth_direct_load'] is False
-assert contract['vllm']['linear_weight_suffix'] == 'weight'
-assert contract['vllm']['linear_weight_layout'] == 'out-in'
-assert set(contract['vllm']['protected_v_first_linear_modules']).isdisjoint(
-    contract['vllm']['quantized_modules']
+require(contract['schema_version'] == 3, 'artifact schema_version must be 3')
+require(
+    contract['candidate'] in (
+        'nvfp4-w4a4',
+        'nvfp4-w4a16',
+        'nvfp4-w4a16-protection-ablation',
+        'w8a16-low-rank-critical-high',
+    ),
+    'artifact candidate is outside the closed set',
+)
+require(
+    contract['vllm']['architecture'] == 'Rwkv7ForCausalLM',
+    'loader architecture is not Rwkv7ForCausalLM',
+)
+require(
+    contract['vllm']['source_format'] == 'standard_hf',
+    'source format is not standard_hf',
+)
+require(
+    contract['vllm']['legacy_pth_direct_load'] is False,
+    'legacy PTH direct load must remain disabled',
+)
+require(
+    contract['vllm']['linear_weight_suffix'] == 'weight',
+    'Linear weight suffix is not the standard weight name',
+)
+require(
+    contract['vllm']['linear_weight_layout'] == 'out-in',
+    'Linear weight layout is not out-in',
+)
+require(
+    set(contract['vllm']['protected_v_first_linear_modules']).isdisjoint(
+        contract['vllm']['quantized_modules']
+    ),
+    'protected v_first modules overlap the quantized inventory',
 )
 
 torch.cuda.reset_peak_memory_stats()
@@ -1617,13 +1780,11 @@ model, loading_info = AutoModelForCausalLM.from_pretrained(
     dtype=runtime_dtype,
     quantization_config=CompressedTensorsConfig(dequantize=True),
     output_loading_info=True,
+    trust_remote_code=False,
 )
-missing_keys = loading_info.get('missing_keys')
-assert isinstance(missing_keys, (list, tuple, set, frozenset))
-missing_quantized_weights = sorted(
-    set(contract['vllm']['quantized_weight_names']) & set(missing_keys)
-)
-assert not missing_quantized_weights, missing_quantized_weights
+_validate_native_rwkv7_runtime(config, model)
+_validate_rwkv7_loading_info(loading_info)
+missing_quantized_weights = []
 model = model.to(dtype=runtime_dtype).eval()
 torch.cuda.synchronize()
 load_latency_ms = (time.perf_counter() - load_started) * 1000.0
@@ -1642,13 +1803,32 @@ protected_parameters = [
     model.get_parameter(name)
     for name in contract['vllm']['protected_parameter_keys']
 ]
-assert all(
-    getattr(module, 'quantization_scheme', None) is not None for module in quantized
+require(
+    all(
+        getattr(module, 'quantization_scheme', None) is not None
+        for module in quantized
+    ),
+    'a quantized module lacks its quantization scheme',
 )
-assert all(module.weight.dtype == runtime_dtype for module in quantized)
-assert all(getattr(module, 'quantization_scheme', None) is None for module in protected)
-assert all(module.weight.dtype == runtime_dtype for module in protected)
-assert all(parameter.dtype == runtime_dtype for parameter in protected_parameters)
+require(
+    all(module.weight.dtype == runtime_dtype for module in quantized),
+    'a dequantized target weight has the wrong runtime dtype',
+)
+require(
+    all(
+        getattr(module, 'quantization_scheme', None) is None
+        for module in protected
+    ),
+    'a protected module unexpectedly has a quantization scheme',
+)
+require(
+    all(module.weight.dtype == runtime_dtype for module in protected),
+    'a protected module weight has the wrong runtime dtype',
+)
+require(
+    all(parameter.dtype == runtime_dtype for parameter in protected_parameters),
+    'a protected physical parameter has the wrong runtime dtype',
+)
 
 prompt = torch.tensor([prompt_ids], device='cuda')
 
@@ -1682,10 +1862,16 @@ with torch.inference_mode():
         torch.cuda.synchronize()
         latencies_ms.append((time.perf_counter() - generate_started) * 1000.0)
 
-assert generated is not None
-assert torch.isfinite(logits).all()
-assert generated.shape == (1, len(prompt_ids) + max_new_tokens)
-assert generated[0, :len(prompt_ids)].tolist() == prompt_ids
+require(generated is not None, 'timed generation produced no output')
+require(torch.isfinite(logits).all(), 'forward logits contain non-finite values')
+require(
+    generated.shape == (1, len(prompt_ids) + max_new_tokens),
+    'generated token shape differs from the requested decode length',
+)
+require(
+    generated[0, :len(prompt_ids)].tolist() == prompt_ids,
+    'generated token prefix differs from the input prompt',
+)
 sorted_latencies_ms = sorted(latencies_ms)
 latency_p90_index = max(0, math.ceil(0.9 * timed_runs) - 1)
 elapsed_seconds = sum(latencies_ms) / 1000.0

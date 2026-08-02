@@ -1,6 +1,9 @@
+import ast
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 
@@ -59,6 +62,48 @@ def _synthetic_runtime_provenance(*_args):
 @pytest.mark.unit
 def test_fresh_reload_program_is_valid_python():
     compile(_fresh_reload_generate_script(), "<rwkv7-fresh-reload>", "exec")
+
+
+@pytest.mark.unit
+def test_fresh_reload_program_fails_closed_under_python_optimize(tmp_path):
+    script = _fresh_reload_generate_script()
+    parsed = ast.parse(script)
+    assert not any(isinstance(node, ast.Assert) for node in ast.walk(parsed))
+    assert script.count("trust_remote_code=False") == 2
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "rwkv7",
+                "architectures": ["Rwkv7ForCausalLM"],
+                "auto_map": {
+                    "AutoConfig": "configuration_rwkv7.Rwkv7Config",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    environment = dict(os.environ)
+    environment["PYTHONOPTIMIZE"] = "1"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(tmp_path),
+            "20260801",
+            "[1, 2, 3, 4]",
+            "1",
+            "1",
+            "1",
+        ],
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode != 0
+    assert "native Transformers classes without auto_map" in result.stderr
 
 
 @pytest.mark.unit

@@ -95,7 +95,6 @@ def _tiny_config():
         eos_token_id=None,
         pad_token_id=0,
         use_cache=True,
-        wkv_backend="reference",
     )
 
 
