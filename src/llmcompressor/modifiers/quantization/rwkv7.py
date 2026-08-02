@@ -1,15 +1,17 @@
 """Conservative quantization targeting for standard Transformers RWKV-7."""
 
 import re
-from typing import Literal
+from typing import Any, Literal
 
 import torch
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 __all__ = [
     "QuantizationTargetPolicyDecision",
     "QuantizationTargetPolicyMetadata",
+    "RWKV7QuantizationRecipeMetadata",
     "apply_rwkv7_target_policy",
+    "build_rwkv7_quantization_recipe",
 ]
 
 
@@ -34,6 +36,47 @@ _TIME_MIX_PARAMETER_NAMES = (
     "k_a",
     "r_k",
 )
+_SUPPORTED_FRAMEWORK_VERSIONS = {
+    "compressed_tensors": "0.17.2.a20260731",
+    "transformers": "5.15.0.dev0",
+}
+_CANDIDATE_SCHEMES = {
+    "nvfp4-w4a4": "NVFP4",
+    "nvfp4-w4a16": "NVFP4A16",
+}
+
+
+class RWKV7QuantizationRecipeMetadata(BaseModel):
+    """Loader-facing contract for one closed RWKV-7 quantization candidate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = 1
+    candidate: Literal["nvfp4-w4a4", "nvfp4-w4a16"]
+    candidate_order: list[str]
+    algorithm: Literal["NVFP4"] = "NVFP4"
+    weight_dtype: Literal["float4"] = "float4"
+    weight_group_size: Literal[16] = 16
+    weight_scale_dtype: Literal["float8_e4m3fn"] = "float8_e4m3fn"
+    input_dtype: Literal["float4", "float16"]
+    input_scale: Literal["dynamic_local", "none"]
+    input_scale_dtype: Literal["float8_e4m3fn"] | None
+    targets: list[str]
+    framework_versions: dict[str, str]
+    quantization_applied: Literal[False] = False
+
+    @model_validator(mode="after")
+    def validate_closed_contract(self):
+        if self.candidate_order != list(_CANDIDATE_SCHEMES):
+            raise ValueError(
+                "RWKV-7 quantization candidate set or order is unsupported"
+            )
+        _validate_framework_versions(self.framework_versions)
+        if not self.targets:
+            raise ValueError(
+                "RWKV-7 quantization recipe requires resolved ChannelMix targets"
+            )
+        return self
 
 
 class QuantizationTargetPolicyDecision(BaseModel):
@@ -57,6 +100,109 @@ class QuantizationTargetPolicyMetadata(BaseModel):
     base_model_prefix: str
     selection: QuantizationTargetPolicyDecision
     protections: list[QuantizationTargetPolicyDecision]
+    recipe: RWKV7QuantizationRecipeMetadata | None = None
+
+
+def _installed_framework_versions() -> dict[str, str]:
+    import compressed_tensors
+    import transformers
+
+    return {
+        "compressed_tensors": compressed_tensors.__version__,
+        "transformers": transformers.__version__,
+    }
+
+
+def _validate_framework_versions(versions: dict[str, str]) -> None:
+    if versions != _SUPPORTED_FRAMEWORK_VERSIONS:
+        raise RuntimeError(
+            "RWKV-7 NVFP4 recipe requires the validated framework versions: "
+            f"expected={_SUPPORTED_FRAMEWORK_VERSIONS} actual={versions}"
+        )
+
+
+def _validate_candidate_scheme(
+    candidate: str,
+    scheme: Any,
+    *,
+    targets: list[str],
+    framework_versions: dict[str, str],
+) -> RWKV7QuantizationRecipeMetadata:
+    weights = scheme.weights
+    inputs = scheme.input_activations
+    expected_inputs = candidate == "nvfp4-w4a4"
+    valid_weights = (
+        weights is not None
+        and weights.num_bits == 4
+        and str(weights.type) == "float"
+        and str(weights.strategy) == "tensor_group"
+        and weights.group_size == 16
+        and str(weights.scale_dtype) == "torch.float8_e4m3fn"
+    )
+    valid_inputs = (inputs is not None) == expected_inputs
+    if inputs is not None:
+        valid_inputs = valid_inputs and (
+            inputs.num_bits == 4
+            and str(inputs.type) == "float"
+            and str(inputs.strategy) == "tensor_group"
+            and inputs.group_size == 16
+            and str(inputs.dynamic) == "local"
+            and str(inputs.scale_dtype) == "torch.float8_e4m3fn"
+        )
+    if not valid_weights or not valid_inputs:
+        raise RuntimeError(
+            "compressed-tensors preset "
+            f"{_CANDIDATE_SCHEMES[candidate]} drifted from RWKV-7 contract"
+        )
+
+    return RWKV7QuantizationRecipeMetadata(
+        candidate=candidate,
+        candidate_order=list(_CANDIDATE_SCHEMES),
+        input_dtype="float4" if inputs is not None else "float16",
+        input_scale="dynamic_local" if inputs is not None else "none",
+        input_scale_dtype="float8_e4m3fn" if inputs is not None else None,
+        targets=targets,
+        framework_versions=framework_versions,
+    )
+
+
+def build_rwkv7_quantization_recipe(
+    model: torch.nn.Module,
+    candidate: str = "nvfp4-w4a4",
+    *,
+    framework_versions: dict[str, str] | None = None,
+):
+    """Build a validated NVFP4-first recipe without applying quantization."""
+
+    if candidate not in _CANDIDATE_SCHEMES:
+        raise ValueError(
+            f"unsupported RWKV-7 quantization candidate {candidate!r}; "
+            f"allowed={list(_CANDIDATE_SCHEMES)}"
+        )
+    versions = (
+        _installed_framework_versions()
+        if framework_versions is None
+        else dict(framework_versions)
+    )
+    _validate_framework_versions(versions)
+
+    from llmcompressor.modifiers.quantization import QuantizationModifier
+
+    modifier = QuantizationModifier(
+        scheme=_CANDIDATE_SCHEMES[candidate],
+        target_policy="rwkv7",
+    )
+    modifier._apply_target_policy(model)
+    recipe_metadata = _validate_candidate_scheme(
+        candidate,
+        next(iter(modifier.resolved_config.config_groups.values())),
+        targets=list(modifier.target_policy_metadata.selection.names),
+        framework_versions=versions,
+    )
+    modifier.target_policy_metadata = modifier.target_policy_metadata.model_copy(
+        update={"recipe": recipe_metadata}
+    )
+    return modifier
 
 
 def _get_rwkv7_model_types() -> tuple[type, type[torch.nn.Module]]:
@@ -136,8 +282,7 @@ def _require_module(
     module = getattr(parent, name, None)
     if not isinstance(module, expected_type):
         raise ValueError(
-            f"RWKV-7 target policy requires `{path}` to be "
-            f"{expected_type.__name__}."
+            f"RWKV-7 target policy requires `{path}` to be {expected_type.__name__}."
         )
     return module
 
@@ -216,6 +361,7 @@ def apply_rwkv7_target_policy(
     later_value_modules: list[str] = []
     other_time_mix_modules: list[str] = []
     later_value_tensors: list[str] = []
+    recurrent_time_mix_tensors: list[str] = []
     expected_linear_modules = {_HEAD_IGNORE}
 
     _require_module(model, "head", torch.nn.Linear, "head")
@@ -233,11 +379,13 @@ def apply_rwkv7_target_policy(
             )
 
         for parameter_name in _TIME_MIX_PARAMETER_NAMES:
+            parameter_path = f"{block_path}.att.{parameter_name}"
             _require_parameter(
                 attention,
                 parameter_name,
-                f"{block_path}.att.{parameter_name}",
+                parameter_path,
             )
+            recurrent_time_mix_tensors.append(parameter_path)
         for parameter_name in ("v0", "v1", "v2"):
             parameter_path = f"{block_path}.att.{parameter_name}"
             if layer_id == 0:
@@ -331,6 +479,14 @@ def apply_rwkv7_target_policy(
                 reason=(
                     "Keep the output head unquantized so this initial policy only "
                     "changes repeated ChannelMix projections."
+                ),
+            ),
+            QuantizationTargetPolicyDecision(
+                kind="tensor",
+                names=recurrent_time_mix_tensors,
+                reason=(
+                    "Protect the standard TimeMix parameters that control recurrent "
+                    "WKV state, receptance, decay, key, value, and gating."
                 ),
             ),
         ],
