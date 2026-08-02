@@ -1,6 +1,6 @@
 """Conservative quantization targeting for standard Transformers RWKV-7."""
 
-from collections.abc import Callable
+import re
 from typing import Literal
 
 import torch
@@ -13,9 +13,6 @@ __all__ = [
 ]
 
 
-_ATTENTION_IGNORE = (
-    r"re:^rwkv7\.blocks\.\d+\.att\.(receptance|key|value|output)$"
-)
 _HEAD_IGNORE = "head"
 _TIME_MIX_LINEAR_NAMES = ("receptance", "key", "value", "output")
 _TIME_MIX_PARAMETER_NAMES = (
@@ -57,20 +54,77 @@ class QuantizationTargetPolicyMetadata(BaseModel):
     policy: Literal["rwkv7"] = "rwkv7"
     policy_version: Literal[1] = 1
     model_type: Literal["rwkv7"] = "rwkv7"
+    base_model_prefix: str
     selection: QuantizationTargetPolicyDecision
     protections: list[QuantizationTargetPolicyDecision]
 
 
-def _get_rwkv7_config_type() -> type:
+def _get_rwkv7_model_types() -> tuple[type, type[torch.nn.Module]]:
     try:
         from transformers import Rwkv7Config
+        from transformers.models.rwkv7 import Rwkv7ForCausalLM
     except ImportError as error:
         raise RuntimeError(
             "The `rwkv7` target policy requires Transformers with the standard "
-            "`Rwkv7Config` API."
+            "`Rwkv7Config` and `Rwkv7ForCausalLM` APIs."
         ) from error
 
-    return Rwkv7Config
+    return Rwkv7Config, Rwkv7ForCausalLM
+
+
+def _resolve_standard_base_model(
+    model: torch.nn.Module,
+) -> tuple[str, torch.nn.Module]:
+    config_type, causal_lm_type = _get_rwkv7_model_types()
+    config = getattr(model, "config", None)
+    if not isinstance(config, config_type) or config.model_type != "rwkv7":
+        raise ValueError(
+            "The `rwkv7` target policy only accepts a model configured by the "
+            "standard Transformers `Rwkv7Config`."
+        )
+    if not isinstance(model, causal_lm_type):
+        raise ValueError(
+            "The `rwkv7` target policy only accepts the standard Transformers "
+            "`Rwkv7ForCausalLM` model."
+        )
+
+    expected_prefix = getattr(causal_lm_type, "base_model_prefix", None)
+    actual_prefix = getattr(model, "base_model_prefix", None)
+    if (
+        not isinstance(expected_prefix, str)
+        or not expected_prefix
+        or actual_prefix != expected_prefix
+    ):
+        raise ValueError(
+            "RWKV-7 target policy requires `base_model_prefix` to match the "
+            f"standard Rwkv7ForCausalLM declaration ({expected_prefix!r}), got "
+            f"{actual_prefix!r}."
+        )
+
+    base_model = getattr(model, "base_model", None)
+    registered_base_model = getattr(model, actual_prefix, None)
+    if (
+        not isinstance(base_model, torch.nn.Module)
+        or base_model is not registered_base_model
+    ):
+        raise ValueError(
+            "RWKV-7 target policy requires the standard `base_model` API to "
+            f"resolve to the registered `{actual_prefix}` submodule."
+        )
+    if getattr(base_model, "config", None) is not config:
+        raise ValueError(
+            "RWKV-7 target policy requires the resolved base model to share the "
+            "causal LM's `Rwkv7Config` instance."
+        )
+
+    return actual_prefix, base_model
+
+
+def _attention_ignore(base_model_prefix: str) -> str:
+    return (
+        rf"re:^{re.escape(base_model_prefix)}\.blocks\.\d+\.att\."
+        r"(receptance|key|value|output)$"
+    )
 
 
 def _require_module(
@@ -97,19 +151,11 @@ def _require_parameter(parent: torch.nn.Module, name: str, path: str) -> None:
 
 
 def _validate_policy_inputs(
-    model: torch.nn.Module,
     resolved_targets: set[str],
     ignore: list[str],
     kv_cache_enabled: bool,
-    config_type_loader: Callable[[], type],
+    attention_ignore: str,
 ) -> None:
-    config_type = config_type_loader()
-    config = getattr(model, "config", None)
-    if not isinstance(config, config_type) or config.model_type != "rwkv7":
-        raise ValueError(
-            "The `rwkv7` target policy only accepts a model configured by the "
-            "standard Transformers `Rwkv7Config`."
-        )
     if resolved_targets != {"Linear"}:
         raise ValueError(
             "The `rwkv7` target policy owns module selection and requires the "
@@ -121,7 +167,7 @@ def _validate_policy_inputs(
             "uses recurrent WKV state instead of a transformer KV cache."
         )
 
-    allowed_ignore = {_ATTENTION_IGNORE, _HEAD_IGNORE}
+    allowed_ignore = {attention_ignore, _HEAD_IGNORE}
     unsupported_ignore = sorted(set(ignore) - allowed_ignore)
     if unsupported_ignore:
         raise ValueError(
@@ -135,7 +181,6 @@ def apply_rwkv7_target_policy(
     resolved_targets: set[str],
     ignore: list[str],
     kv_cache_enabled: bool,
-    config_type_loader: Callable[[], type] | None = None,
 ) -> tuple[list[str], QuantizationTargetPolicyMetadata]:
     """Validate standard RWKV-7 structure and select only ChannelMix linears.
 
@@ -144,21 +189,25 @@ def apply_rwkv7_target_policy(
     the model.
     """
 
+    base_model_prefix, base_model = _resolve_standard_base_model(model)
+    attention_ignore = _attention_ignore(base_model_prefix)
     _validate_policy_inputs(
-        model,
         resolved_targets,
         ignore,
         kv_cache_enabled,
-        config_type_loader or _get_rwkv7_config_type,
+        attention_ignore,
     )
     config = model.config
-    rwkv7 = _require_module(model, "rwkv7", torch.nn.Module, "rwkv7")
     blocks = _require_module(
-        rwkv7, "blocks", torch.nn.ModuleList, "rwkv7.blocks"
+        base_model,
+        "blocks",
+        torch.nn.ModuleList,
+        f"{base_model_prefix}.blocks",
     )
     if len(blocks) != config.num_hidden_layers:
         raise ValueError(
-            "RWKV-7 target policy requires `rwkv7.blocks` length to match "
+            f"RWKV-7 target policy requires `{base_model_prefix}.blocks` length "
+            "to match "
             f"`num_hidden_layers` ({config.num_hidden_layers}), got {len(blocks)}."
         )
 
@@ -171,26 +220,17 @@ def apply_rwkv7_target_policy(
 
     _require_module(model, "head", torch.nn.Linear, "head")
     for layer_id, block in enumerate(blocks):
-        block_path = f"rwkv7.blocks.{layer_id}"
-        if getattr(block, "layer_id", None) != layer_id:
-            raise ValueError(
-                f"RWKV-7 target policy requires `{block_path}.layer_id == "
-                f"{layer_id}`."
-            )
+        block_path = f"{base_model_prefix}.blocks.{layer_id}"
 
         attention = _require_module(block, "att", torch.nn.Module, f"{block_path}.att")
         channel_mix = _require_module(
             block, "ffn", torch.nn.Module, f"{block_path}.ffn"
         )
-        for module, module_path in (
-            (attention, f"{block_path}.att"),
-            (channel_mix, f"{block_path}.ffn"),
-        ):
-            if getattr(module, "layer_id", None) != layer_id:
-                raise ValueError(
-                    f"RWKV-7 target policy requires `{module_path}.layer_id == "
-                    f"{layer_id}`."
-                )
+        if getattr(attention, "layer_id", None) != layer_id:
+            raise ValueError(
+                f"RWKV-7 target policy requires `{block_path}.att.layer_id == "
+                f"{layer_id}`."
+            )
 
         for parameter_name in _TIME_MIX_PARAMETER_NAMES:
             _require_parameter(
@@ -241,8 +281,9 @@ def apply_rwkv7_target_policy(
             f"missing={missing}, unexpected={unexpected}."
         )
 
-    policy_ignore = list(dict.fromkeys([*ignore, _ATTENTION_IGNORE, _HEAD_IGNORE]))
+    policy_ignore = list(dict.fromkeys([*ignore, attention_ignore, _HEAD_IGNORE]))
     metadata = QuantizationTargetPolicyMetadata(
+        base_model_prefix=base_model_prefix,
         selection=QuantizationTargetPolicyDecision(
             kind="module",
             names=selected_modules,

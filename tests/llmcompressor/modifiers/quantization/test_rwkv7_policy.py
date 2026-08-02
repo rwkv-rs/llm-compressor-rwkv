@@ -55,9 +55,8 @@ class _TimeMix(torch.nn.Module):
 
 
 class _ChannelMix(torch.nn.Module):
-    def __init__(self, layer_id: int, hidden_size: int):
+    def __init__(self, hidden_size: int):
         super().__init__()
-        self.layer_id = layer_id
         self.x_k = torch.nn.Parameter(torch.zeros(hidden_size))
         self.key = torch.nn.Linear(hidden_size, hidden_size * 2, bias=False)
         self.value = torch.nn.Linear(hidden_size * 2, hidden_size, bias=False)
@@ -66,20 +65,42 @@ class _ChannelMix(torch.nn.Module):
 class _Block(torch.nn.Module):
     def __init__(self, layer_id: int, hidden_size: int):
         super().__init__()
-        self.layer_id = layer_id
         self.att = _TimeMix(layer_id, hidden_size)
-        self.ffn = _ChannelMix(layer_id, hidden_size)
+        self.ffn = _ChannelMix(hidden_size)
+
+
+class _Rwkv7Model(torch.nn.Module):
+    def __init__(self, config: _Rwkv7Config, hidden_size: int):
+        super().__init__()
+        self.config = config
+        self.blocks = torch.nn.ModuleList(
+            [
+                _Block(layer_id, hidden_size)
+                for layer_id in range(config.num_hidden_layers)
+            ]
+        )
 
 
 class _Rwkv7ForCausalLM(torch.nn.Module):
+    base_model_prefix = "model"
+
     def __init__(self, num_hidden_layers: int = 2, hidden_size: int = 8):
         super().__init__()
         self.config = _Rwkv7Config(num_hidden_layers)
-        self.rwkv7 = torch.nn.Module()
-        self.rwkv7.blocks = torch.nn.ModuleList(
-            [_Block(layer_id, hidden_size) for layer_id in range(num_hidden_layers)]
-        )
+        self.model = _Rwkv7Model(self.config, hidden_size)
         self.head = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+
+    @property
+    def base_model(self):
+        return getattr(self, self.base_model_prefix, self)
+
+
+@pytest.fixture(autouse=True)
+def _standard_rwkv7_types(monkeypatch):
+    monkeypatch.setattr(
+        "llmcompressor.modifiers.quantization.rwkv7._get_rwkv7_model_types",
+        lambda: (_Rwkv7Config, _Rwkv7ForCausalLM),
+    )
 
 
 def _apply_policy(model: torch.nn.Module):
@@ -88,7 +109,6 @@ def _apply_policy(model: torch.nn.Module):
         resolved_targets={"Linear"},
         ignore=[],
         kv_cache_enabled=False,
-        config_type_loader=lambda: _Rwkv7Config,
     )
 
 
@@ -98,26 +118,34 @@ def test_rwkv7_policy_selects_channel_mix_and_records_recurrent_protections():
 
     ignore, metadata = _apply_policy(model)
 
+    assert metadata.base_model_prefix == "model"
     assert ignore == [
-        r"re:^rwkv7\.blocks\.\d+\.att\.(receptance|key|value|output)$",
+        r"re:^model\.blocks\.\d+\.att\.(receptance|key|value|output)$",
         "head",
     ]
     assert metadata.selection.names == [
-        "rwkv7.blocks.0.ffn.key",
-        "rwkv7.blocks.0.ffn.value",
-        "rwkv7.blocks.1.ffn.key",
-        "rwkv7.blocks.1.ffn.value",
+        "model.blocks.0.ffn.key",
+        "model.blocks.0.ffn.value",
+        "model.blocks.1.ffn.key",
+        "model.blocks.1.ffn.value",
     ]
     assert [
         name for name, _ in match_named_modules(model, {"Linear"}, ignore)
     ] == metadata.selection.names
-    assert metadata.protections[0].names == ["rwkv7.blocks.0.att.value"]
+    assert metadata.protections[0].names == ["model.blocks.0.att.value"]
     assert "produces v_first" in metadata.protections[0].reason
     assert metadata.protections[2].names == [
-        "rwkv7.blocks.1.att.v0",
-        "rwkv7.blocks.1.att.v1",
-        "rwkv7.blocks.1.att.v2",
+        "model.blocks.1.att.v0",
+        "model.blocks.1.att.v1",
+        "model.blocks.1.att.v2",
     ]
+    recorded_names = metadata.selection.names + [
+        name for decision in metadata.protections for name in decision.names
+    ]
+    assert all(
+        name == "head" or name.startswith("model.blocks.")
+        for name in recorded_names
+    )
 
 
 @pytest.mark.unit
@@ -131,12 +159,20 @@ def test_rwkv7_policy_selects_channel_mix_and_records_recurrent_protections():
             "Rwkv7Config",
         ),
         (
-            lambda model: delattr(model.rwkv7.blocks[1].att, "v2"),
+            lambda model: setattr(model, "base_model_prefix", "rwkv7"),
+            "base_model_prefix",
+        ),
+        (
+            lambda model: delattr(model, "model"),
+            "base_model.*registered",
+        ),
+        (
+            lambda model: delattr(model.model.blocks[1].att, "v2"),
             r"blocks\.1\.att\.v2",
         ),
         (
             lambda model: setattr(
-                model.rwkv7.blocks[0], "unexpected", torch.nn.Linear(8, 8)
+                model.model.blocks[0], "unexpected", torch.nn.Linear(8, 8)
             ),
             "non-standard Linear",
         ),
@@ -153,7 +189,7 @@ def test_rwkv7_policy_decision_table_fails_closed(mutation, error_match):
 @pytest.mark.unit
 def test_rwkv7_policy_rejects_before_quantization_is_applied(monkeypatch):
     model = _Rwkv7ForCausalLM()
-    del model.rwkv7.blocks[1].att.v2
+    del model.model.blocks[1].att.v2
     state = State()
     state.update(model=model, device="cpu")
     modifier = QuantizationModifier(scheme="W8A8", target_policy="rwkv7")
@@ -163,10 +199,6 @@ def test_rwkv7_policy_rejects_before_quantization_is_applied(monkeypatch):
         nonlocal applied
         applied = True
 
-    monkeypatch.setattr(
-        "llmcompressor.modifiers.quantization.rwkv7._get_rwkv7_config_type",
-        lambda: _Rwkv7Config,
-    )
     monkeypatch.setattr(
         "llmcompressor.modifiers.quantization.quantization.mixin."
         "apply_quantization_config",
@@ -180,13 +212,9 @@ def test_rwkv7_policy_rejects_before_quantization_is_applied(monkeypatch):
 
 
 @pytest.mark.unit
-def test_rwkv7_policy_metadata_recipe_round_trip(monkeypatch):
+def test_rwkv7_policy_metadata_recipe_round_trip():
     model = _Rwkv7ForCausalLM()
     modifier = QuantizationModifier(scheme="W8A8", target_policy="rwkv7")
-    monkeypatch.setattr(
-        "llmcompressor.modifiers.quantization.rwkv7._get_rwkv7_config_type",
-        lambda: _Rwkv7Config,
-    )
     modifier._apply_target_policy(model)
 
     recipe_yaml = Recipe.from_modifiers(modifier).yaml()
@@ -194,5 +222,7 @@ def test_rwkv7_policy_metadata_recipe_round_trip(monkeypatch):
 
     assert restored.target_policy == "rwkv7"
     assert restored.target_policy_metadata == modifier.target_policy_metadata
+    assert "base_model_prefix: model" in recipe_yaml
     assert "produces v_first" in recipe_yaml
-    assert "rwkv7.blocks.1.att.v2" in recipe_yaml
+    assert "model.blocks.1.att.v2" in recipe_yaml
+    assert "rwkv7.blocks" not in recipe_yaml
