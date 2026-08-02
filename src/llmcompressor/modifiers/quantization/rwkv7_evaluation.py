@@ -12,9 +12,14 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from llmcompressor.modifiers.quantization.rwkv7 import (
+    _TRANSFORMERS_RWKV_CONSUMER,
+    _VLLM_RWKV_NVFP4_W4A4_CONSUMER,
+    _VLLM_RWKV_NVFP4_W4A16_CONSUMER,
     RWKV7CheckpointContract,
     _atomic_json,
     _sha256_file,
+    _target_fqns_digest,
+    _vllm_nvfp4_protection_ablation_targets,
 )
 
 __all__ = [
@@ -28,7 +33,6 @@ _CANDIDATES = [
     "nvfp4-w4a4",
     "nvfp4-w4a16",
     "nvfp4-w4a16-protection-ablation",
-    "w8a16-low-rank-critical-high",
 ]
 _VARIANTS = ["baseline-bf16", *_CANDIDATES]
 _SELECTION_METRICS = {
@@ -91,9 +95,27 @@ class PerformanceComparisonContract(BaseModel):
 
     pipeline_revision: str = Field(pattern=_GIT_OID_PATTERN)
     workload_sha256: str = Field(pattern=_SHA256_PATTERN)
+    consumer_capabilities: list[
+        Literal[
+            "vllm-rwkv-nvfp4-w4a4",
+            "vllm-rwkv-nvfp4-w4a16",
+        ]
+    ]
     wkv_mode: Literal["fp16"] = "fp16"
     gemm_accumulation_policy: Literal["fp16"] = "fp16"
     measurement_scope: Literal["canonical-vllm-rwkv"] = "canonical-vllm-rwkv"
+
+    @model_validator(mode="after")
+    def validate_exact_consumer_capabilities(self):
+        if self.consumer_capabilities != [
+            _VLLM_RWKV_NVFP4_W4A4_CONSUMER,
+            _VLLM_RWKV_NVFP4_W4A16_CONSUMER,
+        ]:
+            raise ValueError(
+                "canonical vLLM-RWKV comparison requires exact W4A4 and W4A16 "
+                "consumer capabilities"
+            )
+        return self
 
 
 class EvalScopeComparisonContract(BaseModel):
@@ -130,8 +152,7 @@ class RWKV7ComparisonContract(BaseModel):
             not self.selection_priority
             or len(set(self.selection_priority)) != len(self.selection_priority)
             or any(
-                metric not in _SELECTION_METRICS
-                for metric in self.selection_priority
+                metric not in _SELECTION_METRICS for metric in self.selection_priority
             )
         ):
             raise ValueError("RWKV-7 selection_priority is invalid")
@@ -342,8 +363,7 @@ def _artifact_identity(
         or result.get("formal_checkpoint") is not True
         or result.get("formal_evaluation") is not False
         or result.get("diagnostic_tiny") is not False
-        or result.get("checkpoint", {}).get("sha256")
-        != contract.checkpoint_sha256
+        or result.get("checkpoint", {}).get("sha256") != contract.checkpoint_sha256
     ):
         raise ValueError(
             f"{variant.variant} artifact result is not formal 1.5B evidence"
@@ -355,9 +375,8 @@ def _artifact_identity(
             raise ValueError(f"{variant.variant} artifact result candidate mismatch")
         execution = result.get("execution", {})
         artifact_contract = execution.get("artifact_contract", {})
-        protected_modules = artifact_contract.get("vllm", {}).get(
-            "protected_modules", []
-        )
+        loader_contract = artifact_contract.get("vllm", {})
+        protected_modules = loader_contract.get("protected_modules", [])
         if (
             execution.get("fresh_reload", {}).get("passed") is not True
             or "model.blocks.0.att.value" not in protected_modules
@@ -365,6 +384,59 @@ def _artifact_identity(
             raise ValueError(
                 f"{variant.variant} lacks fresh reload or layer-0 v_first protection"
             )
+        expected_consumer_capability = (
+            _VLLM_RWKV_NVFP4_W4A4_CONSUMER
+            if variant.variant == "nvfp4-w4a4"
+            else _VLLM_RWKV_NVFP4_W4A16_CONSUMER
+        )
+        if (
+            loader_contract.get("quantization_format") != "nvfp4-pack-quantized"
+            or loader_contract.get("vllm_consumer_requirement")
+            != expected_consumer_capability
+            or loader_contract.get("consumer_capabilities")
+            != [_TRANSFORMERS_RWKV_CONSUMER, expected_consumer_capability]
+            or expected_consumer_capability
+            not in contract.performance.consumer_capabilities
+            or loader_contract.get("vllm_consumer_revision")
+            != contract.performance.pipeline_revision
+        ):
+            raise ValueError(
+                f"{variant.variant} lacks its exact executable vLLM RWKV "
+                "consumer capability"
+            )
+        quantized_modules = loader_contract.get("quantized_modules")
+        if (
+            loader_contract.get("target_schema_version") != 1
+            or not isinstance(quantized_modules, list)
+            or loader_contract.get("quantized_target_fqns_digest")
+            != _target_fqns_digest(quantized_modules)
+        ):
+            raise ValueError(
+                f"{variant.variant} has an invalid exact target schema or digest"
+            )
+        if variant.variant == "nvfp4-w4a16-protection-ablation":
+            num_hidden_layers = loader_contract.get("num_hidden_layers")
+            if not isinstance(num_hidden_layers, int) or num_hidden_layers < 2:
+                raise ValueError(
+                    "nvfp4-w4a16-protection-ablation has an invalid layer count"
+                )
+            expected_targets = _vllm_nvfp4_protection_ablation_targets(
+                "model",
+                num_hidden_layers,
+            )
+            if (
+                loader_contract.get("target_schema")
+                != "rwkv7-nvfp4-protection-ablation-no-ffn-v1"
+                or quantized_modules != expected_targets
+                or len(expected_targets) != 9 + 12 * (num_hidden_layers - 1)
+                or any(".ffn." in name for name in expected_targets)
+            ):
+                raise ValueError(
+                    "nvfp4-w4a16-protection-ablation does not match the exact "
+                    "no-FFN 9+12*(L-1) vLLM consumer matrix"
+                )
+        elif loader_contract.get("target_schema") != "rwkv7-nvfp4-critical-high-v1":
+            raise ValueError(f"{variant.variant} has an invalid target schema")
         artifact = result.get("candidate_artifact")
     if (
         not isinstance(artifact, dict)
@@ -439,8 +511,7 @@ def _quality_row(
         total_weight += rule.weight
     return {
         "eligible": all(
-            regressions[metric] <= rule.max_regression
-            for metric, rule in rules.items()
+            regressions[metric] <= rule.max_regression for metric, rule in rules.items()
         ),
         "regressions": regressions,
         "oriented_deltas": oriented_deltas,
@@ -451,16 +522,14 @@ def _quality_row(
 def _dominates(left: dict[str, Any], right: dict[str, Any]) -> bool:
     comparisons = [
         left["quality_delta_score"] >= right["quality_delta_score"],
-        left["throughput_tokens_per_second"]
-        >= right["throughput_tokens_per_second"],
+        left["throughput_tokens_per_second"] >= right["throughput_tokens_per_second"],
         left["artifact_size_bytes"] <= right["artifact_size_bytes"],
         left["peak_vram_bytes"] <= right["peak_vram_bytes"],
         left["latency_p50_ms"] <= right["latency_p50_ms"],
     ]
     strict = [
         left["quality_delta_score"] > right["quality_delta_score"],
-        left["throughput_tokens_per_second"]
-        > right["throughput_tokens_per_second"],
+        left["throughput_tokens_per_second"] > right["throughput_tokens_per_second"],
         left["artifact_size_bytes"] < right["artifact_size_bytes"],
         left["peak_vram_bytes"] < right["peak_vram_bytes"],
         left["latency_p50_ms"] < right["latency_p50_ms"],
@@ -478,9 +547,7 @@ def _select_candidate(
     frontier = [
         row
         for row in eligible
-        if not any(
-            other is not row and _dominates(other, row) for other in eligible
-        )
+        if not any(other is not row and _dominates(other, row) for other in eligible)
     ]
 
     def rank(row: dict[str, Any]):
@@ -566,17 +633,13 @@ def build_rwkv7_pareto_artifact(
             base_dir=evidence_path.parent,
             label=f"{variant.variant} performance result",
         )
-        performance = CanonicalPerformanceEvidence.model_validate(
-            performance_payload
-        )
+        performance = CanonicalPerformanceEvidence.model_validate(performance_payload)
         if (
             performance.artifact_sha256 != artifact["sha256"]
             or performance.checkpoint_sha256 != contract.checkpoint_sha256
-            or performance.pipeline_revision
-            != contract.performance.pipeline_revision
+            or performance.pipeline_revision != contract.performance.pipeline_revision
             or performance.workload_sha256 != contract.performance.workload_sha256
-            or performance.measurement_scope
-            != contract.performance.measurement_scope
+            or performance.measurement_scope != contract.performance.measurement_scope
             or performance.wkv_mode != contract.performance.wkv_mode
             or performance.gemm_accumulation_policy
             != contract.performance.gemm_accumulation_policy
@@ -643,9 +706,7 @@ def build_rwkv7_pareto_artifact(
         for row in rows
         if row["role"] == "candidate"
     ]
-    frontier, selected = _select_candidate(
-        candidate_rows, contract.selection_priority
-    )
+    frontier, selected = _select_candidate(candidate_rows, contract.selection_priority)
     report = {
         "schema_version": 1,
         "style": "unsloth-traceable-quantization-v1",
@@ -661,9 +722,7 @@ def build_rwkv7_pareto_artifact(
         "pareto": {
             "objectives": _SELECTION_METRICS,
             "quality_eligible": [
-                row["variant"]
-                for row in candidate_rows
-                if row["quality_eligible"]
+                row["variant"] for row in candidate_rows if row["quality_eligible"]
             ],
             "frontier": frontier,
             "selection_priority": contract.selection_priority,

@@ -13,15 +13,12 @@ from llmcompressor.modifiers.quantization.rwkv7_evaluation import (
     build_rwkv7_pareto_artifact,
 )
 
-_CHECKPOINT_SHA256 = (
-    "737079d81865801fd85e5459488d89a36d5304a524e890244eb83d44f531c89c"
-)
+_CHECKPOINT_SHA256 = "737079d81865801fd85e5459488d89a36d5304a524e890244eb83d44f531c89c"
 _IMPLEMENTATION_REVISION = "a" * 40
 _CANDIDATES = [
     "nvfp4-w4a4",
     "nvfp4-w4a16",
     "nvfp4-w4a16-protection-ablation",
-    "w8a16-low-rank-critical-high",
 ]
 
 
@@ -66,6 +63,52 @@ def _audit(artifact_sha256: str) -> dict:
 
 
 def _artifact_result(candidate: str, artifact_sha256: str, size_bytes: int) -> dict:
+    if candidate == "nvfp4-w4a16-protection-ablation":
+        quantized_modules = [
+            *(
+                f"model.blocks.0.att.{name}"
+                for name in ("w1", "w2", "a1", "a2", "g1", "g2")
+            ),
+            *(f"model.blocks.0.att.{name}" for name in ("receptance", "key", "output")),
+            *(
+                f"model.blocks.1.att.{name}"
+                for name in (
+                    "w1",
+                    "w2",
+                    "a1",
+                    "a2",
+                    "v1",
+                    "v2",
+                    "g1",
+                    "g2",
+                )
+            ),
+            *(
+                f"model.blocks.1.att.{name}"
+                for name in ("receptance", "key", "value", "output")
+            ),
+        ]
+    else:
+        quantized_modules = [
+            f"model.blocks.{layer}.ffn.{name}"
+            for layer in range(2)
+            for name in ("key", "value")
+        ]
+    consumer_capability = (
+        "vllm-rwkv-nvfp4-w4a4" if candidate == "nvfp4-w4a4" else "vllm-rwkv-nvfp4-w4a16"
+    )
+    target_schema = (
+        "rwkv7-nvfp4-protection-ablation-no-ffn-v1"
+        if candidate == "nvfp4-w4a16-protection-ablation"
+        else "rwkv7-nvfp4-critical-high-v1"
+    )
+    target_digest = hashlib.sha256(
+        json.dumps(
+            quantized_modules,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     return {
         "schema_version": 1,
         "implementation_revision": _IMPLEMENTATION_REVISION,
@@ -75,6 +118,18 @@ def _artifact_result(candidate: str, artifact_sha256: str, size_bytes: int) -> d
             "fresh_reload": {"passed": True},
             "artifact_contract": {
                 "vllm": {
+                    "quantization_format": "nvfp4-pack-quantized",
+                    "target_schema_version": 1,
+                    "target_schema": target_schema,
+                    "num_hidden_layers": 2,
+                    "quantized_target_fqns_digest": target_digest,
+                    "consumer_capabilities": [
+                        "transformers-rwkv-compressed-tensors",
+                        consumer_capability,
+                    ],
+                    "vllm_consumer_requirement": consumer_capability,
+                    "vllm_consumer_revision": "c" * 40,
+                    "quantized_modules": quantized_modules,
                     "protected_modules": ["model.blocks.0.att.value"],
                 }
             },
@@ -129,6 +184,10 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict]:
         "performance": {
             "pipeline_revision": "c" * 40,
             "workload_sha256": performance_workload["sha256"],
+            "consumer_capabilities": [
+                "vllm-rwkv-nvfp4-w4a4",
+                "vllm-rwkv-nvfp4-w4a16",
+            ],
             "wkv_mode": "fp16",
             "gemm_accumulation_policy": "fp16",
             "measurement_scope": "canonical-vllm-rwkv",
@@ -161,15 +220,6 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict]:
             72.0,
             2.0,
         ),
-        "w8a16-low-rank-critical-high": (
-            "5" * 64,
-            300,
-            0.98,
-            250,
-            10.0,
-            80.0,
-            -999.0,
-        ),
     }
     artifact_refs = {}
     for candidate, values in candidate_values.items():
@@ -178,6 +228,10 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict]:
             tmp_path / f"{candidate}-artifact.json",
             _artifact_result(candidate, artifact_sha256, size_bytes),
         )
+    baseline_artifact_ref = _write_json(
+        tmp_path / "baseline-artifact.json",
+        _artifact_result("nvfp4-w4a4", "0" * 64, 3000),
+    )
 
     variants = []
     variant_values = {
@@ -197,7 +251,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict]:
     for variant, values in variant_values.items():
         artifact_sha256, quality, vram, latency, throughput, evalscope_score = values
         result_ref = (
-            artifact_refs["nvfp4-w4a4"]
+            baseline_artifact_ref
             if variant == "baseline-bf16"
             else artifact_refs[variant]
         )
@@ -283,9 +337,7 @@ def test_builds_traceable_formal_pareto_without_using_evalscope_for_selection(
     assert report["formal_checkpoint"] is True
     assert report["formal_evaluation"] is True
     assert report["diagnostic_tiny"] is False
-    assert report["pareto"]["selected_candidate"] == (
-        "w8a16-low-rank-critical-high"
-    )
+    assert report["pareto"]["selected_candidate"] == ("nvfp4-w4a16")
     assert report["pareto"]["evalscope_used_for_selection"] is False
     assert report["pareto"]["quality_eligible"] == _CANDIDATES
     assert [row["variant"] for row in report["variants"]] == [
@@ -310,15 +362,93 @@ def test_rejects_an_incomplete_candidate_search(tmp_path):
 
 
 @pytest.mark.unit
+def test_rejects_w8_diagnostic_in_vllm_comparison_contract(tmp_path):
+    contract_path, evidence_path, output_path, _ = _fixture(tmp_path)
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    contract["candidate_order"].append("w8a16-low-rank-critical-high")
+    _write_json(contract_path, contract)
+
+    with pytest.raises(ValueError, match="closed candidate order"):
+        build_rwkv7_pareto_artifact(contract_path, evidence_path, output_path)
+
+
+@pytest.mark.unit
+def test_rejects_comparison_without_exact_w4a4_and_w4a16_capabilities(tmp_path):
+    contract_path, evidence_path, output_path, _ = _fixture(tmp_path)
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    contract["performance"]["consumer_capabilities"] = ["vllm-rwkv-nvfp4-w4a16"]
+    _write_json(contract_path, contract)
+
+    with pytest.raises(ValueError, match="exact W4A4 and W4A16"):
+        build_rwkv7_pareto_artifact(contract_path, evidence_path, output_path)
+
+
+@pytest.mark.unit
+def test_rejects_non_vllm_consumer_from_canonical_publication(tmp_path):
+    contract_path, evidence_path, output_path, evidence = _fixture(tmp_path)
+    variant = evidence["variants"][1]
+    artifact_path = tmp_path / variant["artifact_result"]["path"]
+    artifact_result = json.loads(artifact_path.read_text(encoding="utf-8"))
+    loader_contract = artifact_result["execution"]["artifact_contract"]["vllm"]
+    loader_contract["consumer_capabilities"] = ["transformers-rwkv-compressed-tensors"]
+    loader_contract["vllm_consumer_revision"] = None
+    variant["artifact_result"] = _write_json(artifact_path, artifact_result)
+    _write_json(evidence_path, evidence)
+
+    with pytest.raises(ValueError, match="lacks its exact executable vLLM RWKV"):
+        build_rwkv7_pareto_artifact(contract_path, evidence_path, output_path)
+
+
+@pytest.mark.unit
+def test_rejects_protection_ablation_target_drift_from_vllm_matrix(tmp_path):
+    contract_path, evidence_path, output_path, evidence = _fixture(tmp_path)
+    variant = next(
+        row
+        for row in evidence["variants"]
+        if row["variant"] == "nvfp4-w4a16-protection-ablation"
+    )
+    artifact_path = tmp_path / variant["artifact_result"]["path"]
+    artifact_result = json.loads(artifact_path.read_text(encoding="utf-8"))
+    loader_contract = artifact_result["execution"]["artifact_contract"]["vllm"]
+    loader_contract["quantized_modules"].pop()
+    loader_contract["quantized_target_fqns_digest"] = hashlib.sha256(
+        json.dumps(
+            loader_contract["quantized_modules"],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    variant["artifact_result"] = _write_json(artifact_path, artifact_result)
+    _write_json(evidence_path, evidence)
+
+    with pytest.raises(ValueError, match=r"no-FFN 9\+12\*\(L-1\)"):
+        build_rwkv7_pareto_artifact(contract_path, evidence_path, output_path)
+
+
+@pytest.mark.unit
+def test_rejects_quantized_target_digest_tamper(tmp_path):
+    contract_path, evidence_path, output_path, evidence = _fixture(tmp_path)
+    variant = evidence["variants"][2]
+    artifact_path = tmp_path / variant["artifact_result"]["path"]
+    artifact_result = json.loads(artifact_path.read_text(encoding="utf-8"))
+    artifact_result["execution"]["artifact_contract"]["vllm"][
+        "quantized_target_fqns_digest"
+    ] = "0" * 64
+    variant["artifact_result"] = _write_json(artifact_path, artifact_result)
+    _write_json(evidence_path, evidence)
+
+    with pytest.raises(ValueError, match="invalid exact target schema or digest"):
+        build_rwkv7_pareto_artifact(contract_path, evidence_path, output_path)
+
+
+@pytest.mark.unit
 def test_rejects_lighteval_prompt_drift_even_with_a_rebound_file(tmp_path):
     contract_path, evidence_path, output_path, evidence = _fixture(tmp_path)
     audit_ref = evidence["variants"][2]["lighteval_sample_audit"]
     audit_path = tmp_path / audit_ref["path"]
     audit = json.loads(audit_path.read_text(encoding="utf-8"))
     audit["tasks"]["gsm8k|0"][0]["model_input_text"] = "different prompt"
-    evidence["variants"][2]["lighteval_sample_audit"] = _write_json(
-        audit_path, audit
-    )
+    evidence["variants"][2]["lighteval_sample_audit"] = _write_json(audit_path, audit)
     _write_json(evidence_path, evidence)
 
     with pytest.raises(ValueError, match="LightEval prompt contract mismatch"):
@@ -331,9 +461,7 @@ def test_rejects_fresh_process_diagnostic_as_canonical_performance(tmp_path):
     performance_ref = evidence["variants"][1]["performance_result"]
     performance_path = tmp_path / performance_ref["path"]
     performance = json.loads(performance_path.read_text(encoding="utf-8"))
-    performance["measurement_scope"] = (
-        "fresh-process-transformers-generate-diagnostic"
-    )
+    performance["measurement_scope"] = "fresh-process-transformers-generate-diagnostic"
     performance["canonical_performance_acceptance"] = False
     evidence["variants"][1]["performance_result"] = _write_json(
         performance_path, performance

@@ -57,6 +57,16 @@ _TIME_MIX_PARAMETER_NAMES = (
 )
 _LOW_RANK_LINEAR_NAMES = ("w1", "w2", "a1", "a2", "g1", "g2")
 _V_FIRST_LINEAR_NAMES = ("v1", "v2")
+_VLLM_NVFP4_LOW_RANK_NAMES = (
+    "w1",
+    "w2",
+    "a1",
+    "a2",
+    "v1",
+    "v2",
+    "g1",
+    "g2",
+)
 _SUPPORTED_FRAMEWORK_VERSIONS = {
     "compressed_tensors": "0.17.2.a20260731",
     "transformers": "5.15.0.dev0",
@@ -100,13 +110,13 @@ _LLM_COMPRESSOR_UPSTREAM_REPOSITORY = (
     "https://github.com/vllm-project/llm-compressor.git"
 )
 _LLM_COMPRESSOR_UPSTREAM_OID = "28c9c76b74cdd47076f95d012227482d22a8f365"
-_LLM_COMPRESSOR_FORK_REPOSITORY = (
-    "https://github.com/rwkv-rs/llm-compressor-rwkv.git"
-)
-_TRANSFORMERS_RWKV_REPOSITORY = (
-    "https://github.com/rwkv-rs/transformers-rwkv.git"
-)
+_LLM_COMPRESSOR_FORK_REPOSITORY = "https://github.com/rwkv-rs/llm-compressor-rwkv.git"
+_TRANSFORMERS_RWKV_REPOSITORY = "https://github.com/rwkv-rs/transformers-rwkv.git"
 _TRANSFORMERS_RWKV_OID = "2696927df9363b5fa175076bb827ba4da2c4e581"
+_VLLM_RWKV_NVFP4_W4A16_CONSUMER_REVISION = "88b992bbc73e8b904ae672dfd39396b6dd0d6ea4"
+_TRANSFORMERS_RWKV_CONSUMER = "transformers-rwkv-compressed-tensors"
+_VLLM_RWKV_NVFP4_W4A4_CONSUMER = "vllm-rwkv-nvfp4-w4a4"
+_VLLM_RWKV_NVFP4_W4A16_CONSUMER = "vllm-rwkv-nvfp4-w4a16"
 _G1H_1_5B_CHECKPOINT = {
     "model_id": "g1h-1.5b",
     "repository": "BlinkDL/rwkv7-g1",
@@ -117,6 +127,84 @@ _G1H_1_5B_CHECKPOINT = {
 }
 
 
+def _vllm_nvfp4_protection_ablation_targets(
+    base_model_prefix: str,
+    num_hidden_layers: int,
+) -> list[str]:
+    if num_hidden_layers < 2:
+        raise ValueError("RWKV-7 vLLM protection ablation requires at least two blocks")
+    layer_zero_prefix = f"{base_model_prefix}.blocks.0.att"
+    targets = [
+        *(f"{layer_zero_prefix}.{name}" for name in _LOW_RANK_LINEAR_NAMES),
+        *(f"{layer_zero_prefix}.{name}" for name in ("receptance", "key", "output")),
+    ]
+    targets.extend(
+        target
+        for layer_id in range(1, num_hidden_layers)
+        for target in (
+            *(
+                f"{base_model_prefix}.blocks.{layer_id}.att.{name}"
+                for name in _VLLM_NVFP4_LOW_RANK_NAMES
+            ),
+            *(
+                f"{base_model_prefix}.blocks.{layer_id}.att.{name}"
+                for name in _TIME_MIX_LINEAR_NAMES
+            ),
+        )
+    )
+    return targets
+
+
+def _critical_high_targets(
+    base_model_prefix: str,
+    num_hidden_layers: int,
+) -> list[str]:
+    return [
+        f"{base_model_prefix}.blocks.{layer_id}.ffn.{name}"
+        for layer_id in range(num_hidden_layers)
+        for name in ("key", "value")
+    ]
+
+
+def _low_rank_w8_critical_high_targets(
+    base_model_prefix: str,
+    num_hidden_layers: int,
+) -> list[str]:
+    return [
+        *(
+            f"{base_model_prefix}.blocks.{layer_id}.att.{name}"
+            for layer_id in range(num_hidden_layers)
+            for name in _LOW_RANK_LINEAR_NAMES
+        ),
+        *_critical_high_targets(base_model_prefix, num_hidden_layers),
+    ]
+
+
+def _exact_target_schema_modules(
+    target_schema: str,
+    base_model_prefix: str,
+    num_hidden_layers: int,
+) -> list[str]:
+    if target_schema == "rwkv7-nvfp4-critical-high-v1":
+        return _critical_high_targets(base_model_prefix, num_hidden_layers)
+    if target_schema == "rwkv7-nvfp4-protection-ablation-no-ffn-v1":
+        return _vllm_nvfp4_protection_ablation_targets(
+            base_model_prefix,
+            num_hidden_layers,
+        )
+    if target_schema == "rwkv7-w8-low-rank-critical-high-v1":
+        return _low_rank_w8_critical_high_targets(
+            base_model_prefix,
+            num_hidden_layers,
+        )
+    raise ValueError(f"unsupported RWKV-7 target schema: {target_schema}")
+
+
+def _target_fqns_digest(names: list[str]) -> str:
+    serialized = json.dumps(names, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
 class RWKV7RepositoryContract(BaseModel):
     """Immutable source/fork identity for this RWKV-7 adaptation."""
 
@@ -125,18 +213,18 @@ class RWKV7RepositoryContract(BaseModel):
     upstream_repository: Literal[
         "https://github.com/vllm-project/llm-compressor.git"
     ] = _LLM_COMPRESSOR_UPSTREAM_REPOSITORY
-    upstream_oid: Literal[
-        "28c9c76b74cdd47076f95d012227482d22a8f365"
-    ] = _LLM_COMPRESSOR_UPSTREAM_OID
-    fork_repository: Literal[
-        "https://github.com/rwkv-rs/llm-compressor-rwkv.git"
-    ] = _LLM_COMPRESSOR_FORK_REPOSITORY
+    upstream_oid: Literal["28c9c76b74cdd47076f95d012227482d22a8f365"] = (
+        _LLM_COMPRESSOR_UPSTREAM_OID
+    )
+    fork_repository: Literal["https://github.com/rwkv-rs/llm-compressor-rwkv.git"] = (
+        _LLM_COMPRESSOR_FORK_REPOSITORY
+    )
     transformers_repository: Literal[
         "https://github.com/rwkv-rs/transformers-rwkv.git"
     ] = _TRANSFORMERS_RWKV_REPOSITORY
-    transformers_oid: Literal[
-        "2696927df9363b5fa175076bb827ba4da2c4e581"
-    ] = _TRANSFORMERS_RWKV_OID
+    transformers_oid: Literal["2696927df9363b5fa175076bb827ba4da2c4e581"] = (
+        _TRANSFORMERS_RWKV_OID
+    )
 
 
 class RWKV7TransformersProvenance(BaseModel):
@@ -170,9 +258,7 @@ class RWKV7ImplementationProvenance(BaseModel):
     @model_validator(mode="after")
     def validate_revision(self) -> RWKV7ImplementationProvenance:
         if re.fullmatch(r"[0-9a-f]{40}", self.revision) is None:
-            raise ValueError(
-                "RWKV-7 llm-compressor provenance requires a full Git OID"
-            )
+            raise ValueError("RWKV-7 llm-compressor provenance requires a full Git OID")
         return self
 
 
@@ -220,7 +306,9 @@ def _canonical_repository_url(repository: str) -> str:
     if normalized.startswith("git@github.com:"):
         normalized = f"https://github.com/{normalized.removeprefix('git@github.com:')}"
     elif normalized.startswith("ssh://git@github.com/"):
-        normalized = f"https://github.com/{normalized.removeprefix('ssh://git@github.com/')}"
+        normalized = (
+            f"https://github.com/{normalized.removeprefix('ssh://git@github.com/')}"
+        )
     return normalized.removesuffix(".git")
 
 
@@ -476,27 +564,25 @@ class RWKV7CheckpointContract(BaseModel):
 
     model_id: Literal["g1h-1.5b"] = _G1H_1_5B_CHECKPOINT["model_id"]
     repository: Literal["BlinkDL/rwkv7-g1"] = _G1H_1_5B_CHECKPOINT["repository"]
-    revision: Literal[
-        "6d5762253b343eec6cfbf5ed62f872f30a4cd89c"
-    ] = _G1H_1_5B_CHECKPOINT["revision"]
-    filename: Literal[
-        "rwkv7-g1h-1.5b-20260710-ctx10240.pth"
-    ] = _G1H_1_5B_CHECKPOINT["filename"]
+    revision: Literal["6d5762253b343eec6cfbf5ed62f872f30a4cd89c"] = (
+        _G1H_1_5B_CHECKPOINT["revision"]
+    )
+    filename: Literal["rwkv7-g1h-1.5b-20260710-ctx10240.pth"] = _G1H_1_5B_CHECKPOINT[
+        "filename"
+    ]
     sha256: Literal[
         "737079d81865801fd85e5459488d89a36d5304a524e890244eb83d44f531c89c"
     ] = _G1H_1_5B_CHECKPOINT["sha256"]
     size_bytes: Literal[3055444605] = _G1H_1_5B_CHECKPOINT["size_bytes"]
     source_format: Literal["legacy_pth"] = "legacy_pth"
-    converted_format: Literal["standard_hf_safetensors"] = (
-        "standard_hf_safetensors"
-    )
+    converted_format: Literal["standard_hf_safetensors"] = "standard_hf_safetensors"
     architecture: Literal["Rwkv7ForCausalLM"] = "Rwkv7ForCausalLM"
     model_type: Literal["rwkv7"] = "rwkv7"
     embedding_layer_norm_fused: Literal[False] = False
 
 
 class RWKV7VLLMLoaderMetadata(BaseModel):
-    """Metadata consumed by the standard-HF vLLM-RWKV loader boundary."""
+    """Producer inventory and executable standard-HF consumer capabilities."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -506,9 +592,30 @@ class RWKV7VLLMLoaderMetadata(BaseModel):
     load_format: Literal["safetensors"] = "safetensors"
     quant_method: Literal["compressed-tensors"] = "compressed-tensors"
     quantization_format: Literal["nvfp4-pack-quantized", "pack-quantized"]
-    embedding_name: Literal["model.embeddings.weight"] = (
-        "model.embeddings.weight"
+    target_schema_version: Literal[1] = 1
+    target_schema: Literal[
+        "rwkv7-nvfp4-critical-high-v1",
+        "rwkv7-nvfp4-protection-ablation-no-ffn-v1",
+        "rwkv7-w8-low-rank-critical-high-v1",
+    ]
+    num_hidden_layers: int = Field(ge=1)
+    quantized_target_fqns_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    consumer_capabilities: list[
+        Literal[
+            "transformers-rwkv-compressed-tensors",
+            "vllm-rwkv-nvfp4-w4a4",
+            "vllm-rwkv-nvfp4-w4a16",
+        ]
+    ]
+    vllm_consumer_requirement: (
+        Literal[
+            "vllm-rwkv-nvfp4-w4a4",
+            "vllm-rwkv-nvfp4-w4a16",
+        ]
+        | None
     )
+    vllm_consumer_revision: str | None
+    embedding_name: Literal["model.embeddings.weight"] = "model.embeddings.weight"
     block_prefix: Literal["model.blocks."] = "model.blocks."
     output_norm_prefix: Literal["model.ln_out."] = "model.ln_out."
     head_name: Literal["head.weight"] = "head.weight"
@@ -528,6 +635,7 @@ class RWKV7VLLMLoaderMetadata(BaseModel):
     protected_state_tensors: list[str]
     protected_modules: list[str]
     protected_tensors: list[str]
+    protected_parameter_keys: list[str]
 
     @model_validator(mode="after")
     def validate_standard_linear_ownership(self) -> RWKV7VLLMLoaderMetadata:
@@ -536,21 +644,20 @@ class RWKV7VLLMLoaderMetadata(BaseModel):
             "quantized_weight_names": self.quantized_weight_names,
             "low_rank_linear_modules": self.low_rank_linear_modules,
             "quantized_low_rank_modules": self.quantized_low_rank_modules,
-            "protected_v_first_linear_modules": (
-                self.protected_v_first_linear_modules
-            ),
+            "protected_v_first_linear_modules": (self.protected_v_first_linear_modules),
             "protected_linear_modules": self.protected_linear_modules,
             "protected_embedding_modules": self.protected_embedding_modules,
-            "protected_normalization_modules": (
-                self.protected_normalization_modules
-            ),
+            "protected_normalization_modules": (self.protected_normalization_modules),
             "protected_state_tensors": self.protected_state_tensors,
             "protected_modules": self.protected_modules,
             "protected_tensors": self.protected_tensors,
+            "protected_parameter_keys": self.protected_parameter_keys,
         }
         for label, names in inventories.items():
             if len(names) != len(set(names)):
                 raise ValueError(f"RWKV-7 vLLM metadata duplicates {label}")
+        if len(self.consumer_capabilities) != len(set(self.consumer_capabilities)):
+            raise ValueError("RWKV-7 consumer capabilities must be unique")
         expected_weight_names = [
             f"{name}.{self.linear_weight_suffix}" for name in self.quantized_modules
         ]
@@ -558,11 +665,42 @@ class RWKV7VLLMLoaderMetadata(BaseModel):
             raise ValueError(
                 "RWKV-7 vLLM quantized weights must use standard Linear ownership"
             )
+        if self.quantized_target_fqns_digest != _target_fqns_digest(
+            self.quantized_modules
+        ):
+            raise ValueError(
+                "RWKV-7 quantized target FQN digest differs from the exact inventory"
+            )
         quantized = set(self.quantized_modules)
         protected = set(self.protected_modules)
         protected_linear = set(self.protected_linear_modules)
         protected_embedding = set(self.protected_embedding_modules)
         protected_normalization = set(self.protected_normalization_modules)
+        inventory_block_ids = sorted(
+            {
+                int(match.group(1))
+                for name in [
+                    *self.quantized_modules,
+                    *self.protected_modules,
+                    *self.protected_state_tensors,
+                ]
+                if (match := re.match(r"^model\.blocks\.(\d+)\.", name))
+            }
+        )
+        if inventory_block_ids != list(range(self.num_hidden_layers)):
+            raise ValueError(
+                "RWKV-7 layer count differs from the complete module/tensor inventory"
+            )
+        expected_quantized_modules = _exact_target_schema_modules(
+            self.target_schema,
+            "model",
+            self.num_hidden_layers,
+        )
+        if self.quantized_modules != expected_quantized_modules:
+            raise ValueError(
+                "RWKV-7 quantized modules differ from the exact expanded target "
+                f"schema {self.target_schema!r}"
+            )
         low_rank = set(self.low_rank_linear_modules)
         quantized_low_rank = set(self.quantized_low_rank_modules)
         protected_v_first = set(self.protected_v_first_linear_modules)
@@ -571,19 +709,31 @@ class RWKV7VLLMLoaderMetadata(BaseModel):
         if (
             protected_linear | protected_embedding | protected_normalization
         ) != protected:
-            raise ValueError(
-                "RWKV-7 vLLM protected module categories are incomplete"
-            )
+            raise ValueError("RWKV-7 vLLM protected module categories are incomplete")
         if (
             protected_linear & protected_embedding
             or protected_linear & protected_normalization
             or protected_embedding & protected_normalization
         ):
-            raise ValueError(
-                "RWKV-7 vLLM protected module categories must be disjoint"
-            )
+            raise ValueError("RWKV-7 vLLM protected module categories must be disjoint")
         if self.protected_state_tensors != self.protected_tensors:
             raise ValueError("RWKV-7 vLLM protected state inventory drifted")
+        expected_protected_parameter_keys = [
+            *(f"{name}.weight" for name in self.protected_linear_modules),
+            *(f"{name}.weight" for name in self.protected_embedding_modules),
+            *(
+                parameter_name
+                for name in self.protected_normalization_modules
+                for parameter_name in (f"{name}.weight", f"{name}.bias")
+            ),
+            *self.protected_state_tensors,
+        ]
+        if self.protected_parameter_keys != expected_protected_parameter_keys:
+            raise ValueError(
+                "RWKV-7 protected parameter inventory must include every "
+                "Linear/Embedding weight, normalization weight and bias, and "
+                "protected state tensor"
+            )
         if not quantized_low_rank <= low_rank or not quantized_low_rank <= quantized:
             raise ValueError(
                 "RWKV-7 vLLM quantized low-rank modules drifted from ownership"
@@ -594,6 +744,44 @@ class RWKV7VLLMLoaderMetadata(BaseModel):
             raise ValueError("RWKV-7 vLLM v_first Linear protection is incomplete")
         if self.layer_zero_v_first_producer not in protected_linear:
             raise ValueError("RWKV-7 vLLM layer-0 v_first producer is not protected")
+        if self.quantization_format == "pack-quantized":
+            if self.consumer_capabilities != [_TRANSFORMERS_RWKV_CONSUMER]:
+                raise ValueError(
+                    "RWKV-7 W8 pack-quantized artifacts are not executable vLLM "
+                    "NVFP4 consumer artifacts"
+                )
+            if (
+                self.vllm_consumer_requirement is not None
+                or self.vllm_consumer_revision is not None
+            ):
+                raise ValueError(
+                    "RWKV-7 W8 pack-quantized artifacts cannot claim a vLLM "
+                    "consumer requirement or revision"
+                )
+        else:
+            if self.vllm_consumer_requirement not in {
+                _VLLM_RWKV_NVFP4_W4A4_CONSUMER,
+                _VLLM_RWKV_NVFP4_W4A16_CONSUMER,
+            }:
+                raise ValueError(
+                    "RWKV-7 NVFP4 artifacts must declare an exact W4A4 or W4A16 "
+                    "vLLM consumer requirement"
+                )
+            has_executable_capability = (
+                self.vllm_consumer_requirement in self.consumer_capabilities
+            )
+            if has_executable_capability != (self.vllm_consumer_revision is not None):
+                raise ValueError(
+                    "RWKV-7 NVFP4 executable capability and consumer revision "
+                    "must be declared together"
+                )
+            if (
+                self.vllm_consumer_revision is not None
+                and re.fullmatch(r"[0-9a-f]{40}", self.vllm_consumer_revision) is None
+            ):
+                raise ValueError(
+                    "RWKV-7 NVFP4 vLLM consumer revision must be a full Git OID"
+                )
         return self
 
 
@@ -622,13 +810,10 @@ class RWKV7ArtifactContract(BaseModel):
         recipe = self.target_policy.recipe
         if recipe is None or not recipe.quantization_applied:
             raise ValueError(
-                "RWKV-7 compressed artifact metadata must record applied "
-                "quantization"
+                "RWKV-7 compressed artifact metadata must record applied quantization"
             )
         if self.candidate != recipe.candidate:
-            raise ValueError(
-                "RWKV-7 artifact candidate must match recipe metadata"
-            )
+            raise ValueError("RWKV-7 artifact candidate must match recipe metadata")
         if self.runtime_provenance != recipe.runtime_provenance:
             raise ValueError(
                 "RWKV-7 artifact runtime provenance must match recipe metadata"
@@ -642,10 +827,74 @@ class RWKV7ArtifactContract(BaseModel):
             raise ValueError(
                 "RWKV-7 artifact candidate and quantization format are inconsistent"
             )
+        expected_target_schema = {
+            "nvfp4-w4a4": "rwkv7-nvfp4-critical-high-v1",
+            "nvfp4-w4a16": "rwkv7-nvfp4-critical-high-v1",
+            "nvfp4-w4a16-protection-ablation": (
+                "rwkv7-nvfp4-protection-ablation-no-ffn-v1"
+            ),
+            "w8a16-low-rank-critical-high": ("rwkv7-w8-low-rank-critical-high-v1"),
+        }[self.candidate]
+        if self.vllm.target_schema != expected_target_schema:
+            raise ValueError(
+                "RWKV-7 artifact candidate and target schema are inconsistent"
+            )
+        expected_vllm_requirement = {
+            "nvfp4-w4a4": _VLLM_RWKV_NVFP4_W4A4_CONSUMER,
+            "nvfp4-w4a16": _VLLM_RWKV_NVFP4_W4A16_CONSUMER,
+            "nvfp4-w4a16-protection-ablation": (_VLLM_RWKV_NVFP4_W4A16_CONSUMER),
+            "w8a16-low-rank-critical-high": None,
+        }[self.candidate]
+        if self.vllm.vllm_consumer_requirement != expected_vllm_requirement:
+            raise ValueError(
+                "RWKV-7 artifact candidate and exact vLLM consumer requirement "
+                "are inconsistent"
+            )
+        if self.candidate == "nvfp4-w4a4":
+            if (
+                self.vllm.consumer_capabilities != [_TRANSFORMERS_RWKV_CONSUMER]
+                or self.vllm.vllm_consumer_revision is not None
+            ):
+                raise ValueError(
+                    "RWKV-7 W4A4 cannot claim vLLM execution before its native "
+                    "consumer capability is revision-pinned"
+                )
+        elif self.candidate in {
+            "nvfp4-w4a16",
+            "nvfp4-w4a16-protection-ablation",
+        }:
+            if (
+                self.vllm.consumer_capabilities
+                != [
+                    _TRANSFORMERS_RWKV_CONSUMER,
+                    _VLLM_RWKV_NVFP4_W4A16_CONSUMER,
+                ]
+                or self.vllm.vllm_consumer_revision
+                != _VLLM_RWKV_NVFP4_W4A16_CONSUMER_REVISION
+            ):
+                raise ValueError(
+                    "RWKV-7 W4A16 requires its revision-pinned vLLM consumer capability"
+                )
         if self.vllm.quantized_modules != self.target_policy.selection.names:
             raise ValueError(
                 "RWKV-7 artifact quantized inventory must match target policy"
             )
+        if self.candidate == "nvfp4-w4a16-protection-ablation":
+            expected_ablation_targets = _vllm_nvfp4_protection_ablation_targets(
+                self.target_policy.base_model_prefix,
+                self.vllm.num_hidden_layers,
+            )
+            if self.vllm.quantized_modules != expected_ablation_targets:
+                raise ValueError(
+                    "RWKV-7 protection ablation must exactly match the validated "
+                    "no-FFN 9+12*(L-1) vLLM NVFP4 consumer matrix"
+                )
+            if len(expected_ablation_targets) != (
+                9 + 12 * (self.vllm.num_hidden_layers - 1)
+            ) or any(".ffn." in name for name in expected_ablation_targets):
+                raise ValueError(
+                    "RWKV-7 protection ablation target count or FFN exclusion drifted"
+                )
         protected_modules = [
             name
             for decision in self.target_policy.protections
@@ -802,7 +1051,8 @@ def build_rwkv7_artifact_contract(
         for name in decision.names
     ]
     all_modules = [*target_policy.selection.names, *protected_modules]
-    low_rank_suffixes = tuple(f".{name}" for name in _LOW_RANK_LINEAR_NAMES)
+    low_rank_suffixes = tuple(f".{name}" for name in _VLLM_NVFP4_LOW_RANK_NAMES)
+    w_a_g_suffixes = tuple(f".{name}" for name in _LOW_RANK_LINEAR_NAMES)
     v_first_suffixes = tuple(f".{name}" for name in _V_FIRST_LINEAR_NAMES)
     low_rank_modules = sorted(
         name for name in all_modules if name.endswith(low_rank_suffixes)
@@ -812,6 +1062,7 @@ def build_rwkv7_artifact_contract(
         for name in target_policy.selection.names
         if name.endswith(low_rank_suffixes)
     ]
+    w_a_g_modules = {name for name in all_modules if name.endswith(w_a_g_suffixes)}
     protected_v_first_linear_modules = sorted(
         name for name in protected_modules if name.endswith(v_first_suffixes)
     )
@@ -836,12 +1087,40 @@ def build_rwkv7_artifact_contract(
     protected_normalization_modules = [
         name
         for name in protected_modules
-        if name not in set(protected_linear_modules)
-        | set(protected_embedding_modules)
+        if name not in set(protected_linear_modules) | set(protected_embedding_modules)
     ]
-    if candidate == "w8a16-low-rank-critical-high" and set(
-        quantized_low_rank_modules
-    ) != set(low_rank_modules):
+    protected_parameter_keys = [
+        *(f"{name}.weight" for name in protected_linear_modules),
+        *(f"{name}.weight" for name in protected_embedding_modules),
+        *(
+            parameter_name
+            for name in protected_normalization_modules
+            for parameter_name in (f"{name}.weight", f"{name}.bias")
+        ),
+        *protected_tensors,
+    ]
+    block_ids = sorted(
+        {
+            int(match.group(1))
+            for name in [*all_modules, *protected_tensors]
+            if (
+                match := re.match(
+                    rf"^{re.escape(target_policy.base_model_prefix)}\.blocks\."
+                    r"(\d+)\.",
+                    name,
+                )
+            )
+        }
+    )
+    if not block_ids or block_ids != list(range(block_ids[-1] + 1)):
+        raise ValueError(
+            "RWKV-7 artifact block inventory must be non-empty and contiguous"
+        )
+    num_hidden_layers = block_ids[-1] + 1
+    if (
+        candidate == "w8a16-low-rank-critical-high"
+        and set(quantized_low_rank_modules) != w_a_g_modules
+    ):
         raise ValueError(
             "RWKV-7 low-rank W8 candidate must quantize every standard w/a/g "
             "Linear module"
@@ -850,9 +1129,7 @@ def build_rwkv7_artifact_contract(
         raise ValueError("RWKV-7 low-rank W8 selection touches v_first gating")
     layer_zero_value = f"{target_policy.base_model_prefix}.blocks.0.att.value"
     if layer_zero_value not in protected_modules:
-        raise ValueError(
-            "RWKV-7 artifact must protect the layer-0 v_first producer"
-        )
+        raise ValueError("RWKV-7 artifact must protect the layer-0 v_first producer")
     if any(name.startswith("rwkv7.") for name in target_policy.selection.names):
         raise ValueError("RWKV-7 artifact contains non-standard module names")
     return RWKV7ArtifactContract(
@@ -867,7 +1144,50 @@ def build_rwkv7_artifact_contract(
                 if candidate == "w8a16-low-rank-critical-high"
                 else "nvfp4-pack-quantized"
             ),
+            target_schema=(
+                "rwkv7-w8-low-rank-critical-high-v1"
+                if candidate == "w8a16-low-rank-critical-high"
+                else (
+                    "rwkv7-nvfp4-protection-ablation-no-ffn-v1"
+                    if candidate == "nvfp4-w4a16-protection-ablation"
+                    else "rwkv7-nvfp4-critical-high-v1"
+                )
+            ),
+            consumer_capabilities=(
+                [_TRANSFORMERS_RWKV_CONSUMER]
+                if candidate
+                in {
+                    "nvfp4-w4a4",
+                    "w8a16-low-rank-critical-high",
+                }
+                else [
+                    _TRANSFORMERS_RWKV_CONSUMER,
+                    _VLLM_RWKV_NVFP4_W4A16_CONSUMER,
+                ]
+            ),
+            vllm_consumer_requirement=(
+                None
+                if candidate == "w8a16-low-rank-critical-high"
+                else (
+                    _VLLM_RWKV_NVFP4_W4A4_CONSUMER
+                    if candidate == "nvfp4-w4a4"
+                    else _VLLM_RWKV_NVFP4_W4A16_CONSUMER
+                )
+            ),
+            vllm_consumer_revision=(
+                None
+                if candidate
+                in {
+                    "nvfp4-w4a4",
+                    "w8a16-low-rank-critical-high",
+                }
+                else _VLLM_RWKV_NVFP4_W4A16_CONSUMER_REVISION
+            ),
+            num_hidden_layers=num_hidden_layers,
             quantized_modules=list(target_policy.selection.names),
+            quantized_target_fqns_digest=_target_fqns_digest(
+                target_policy.selection.names
+            ),
             quantized_weight_names=[
                 f"{name}.weight" for name in target_policy.selection.names
             ],
@@ -881,6 +1201,7 @@ def build_rwkv7_artifact_contract(
             protected_state_tensors=protected_tensors,
             protected_modules=protected_modules,
             protected_tensors=protected_tensors,
+            protected_parameter_keys=protected_parameter_keys,
         ),
         formal_checkpoint=checkpoint is not None,
     )
@@ -1178,13 +1499,9 @@ def audit_rwkv7_quantized_checkpoint(
             "I32" if candidate == "w8a16-low-rank-critical-high" else "U8"
         )
         if tensors[f"{target}.weight_packed"][1] != expected_packed_dtype:
-            raise RuntimeError(
-                f"RWKV-7 target has drifted packed dtype: {target}"
-            )
+            raise RuntimeError(f"RWKV-7 target has drifted packed dtype: {target}")
         expected_scale_dtype = (
-            "F32"
-            if candidate == "w8a16-low-rank-critical-high"
-            else "F8_E4M3"
+            "F32" if candidate == "w8a16-low-rank-critical-high" else "F8_E4M3"
         )
         if tensors[f"{target}.weight_scale"][1] != expected_scale_dtype:
             raise RuntimeError(f"RWKV-7 target has drifted scale dtype: {target}")
@@ -1193,10 +1510,7 @@ def audit_rwkv7_quantized_checkpoint(
             and tensors[f"{target}.weight_shape"][1] != "I64"
         ):
             raise RuntimeError(f"RWKV-7 target has drifted shape dtype: {target}")
-    protected_names = set(loaded_contract.vllm.protected_tensors)
-    protected_names.update(
-        f"{name}.weight" for name in loaded_contract.vllm.protected_modules
-    )
+    protected_names = set(loaded_contract.vllm.protected_parameter_keys)
     missing_protected = sorted(protected_names - tensors.keys())
     if missing_protected:
         raise RuntimeError(
@@ -1209,12 +1523,11 @@ def audit_rwkv7_quantized_checkpoint(
     for name in loaded_contract.vllm.protected_tensors:
         if any(key.startswith(f"{name}_") for key in tensors):
             raise RuntimeError(f"RWKV-7 protected tensor was transformed: {name}")
-    protected = sorted(protected_names)
     return {
         "format": expected_format,
         "targets": expected_targets,
         "quantized_weight_names": [f"{name}.weight" for name in expected_targets],
-        "protected_tensor_count": len(protected),
+        "protected_parameter_count": len(protected_names),
         "tensor_count": len(tensors),
         "input_quantized": input_quantized,
         "artifact_contract_serialized": True,
@@ -1325,8 +1638,9 @@ quantized = [
 protected = [
     model.get_submodule(name) for name in contract['vllm']['protected_modules']
 ]
-protected_tensors = [
-    model.get_parameter(name) for name in contract['vllm']['protected_tensors']
+protected_parameters = [
+    model.get_parameter(name)
+    for name in contract['vllm']['protected_parameter_keys']
 ]
 assert all(
     getattr(module, 'quantization_scheme', None) is not None for module in quantized
@@ -1334,7 +1648,7 @@ assert all(
 assert all(module.weight.dtype == runtime_dtype for module in quantized)
 assert all(getattr(module, 'quantization_scheme', None) is None for module in protected)
 assert all(module.weight.dtype == runtime_dtype for module in protected)
-assert all(parameter.dtype == runtime_dtype for parameter in protected_tensors)
+assert all(parameter.dtype == runtime_dtype for parameter in protected_parameters)
 
 prompt = torch.tensor([prompt_ids], device='cuda')
 
@@ -1380,7 +1694,8 @@ print(json.dumps({
     'logits_dtype': str(logits.dtype),
     'quantized_module_count': len(quantized),
     'protected_module_count': len(protected),
-    'protected_tensor_count': len(protected_tensors),
+    'protected_state_tensor_count': len(contract['vllm']['protected_tensors']),
+    'protected_parameter_count': len(protected_parameters),
     'artifact_contract_validated': True,
     'transformers_provenance': transformers_provenance,
     'standard_linear_load': {
@@ -1494,9 +1809,7 @@ def quantize_rwkv7_oneshot(
                 torch.cuda.synchronize()
             quantization_runtime = {
                 "scope": "llmcompressor-oneshot",
-                "latency_ms": (
-                    time.perf_counter() - quantization_started
-                ) * 1000.0,
+                "latency_ms": (time.perf_counter() - quantization_started) * 1000.0,
                 "cuda_measured": torch.cuda.is_available(),
                 "peak_allocated_bytes": (
                     torch.cuda.max_memory_allocated()
@@ -1632,9 +1945,7 @@ def quantize_rwkv7_oneshot(
                     "error": reload_run.stderr[-8000:],
                 }
             )
-            _atomic_json(
-                destination / "rwkv7_quantization_execution.json", metadata
-            )
+            _atomic_json(destination / "rwkv7_quantization_execution.json", metadata)
             continue
         return result, metadata
     raise RuntimeError(f"all RWKV-7 quantization candidates failed: {failures}")
@@ -1904,9 +2215,7 @@ def run_rwkv7_checkpoint_candidate(
         fresh_reload_prompt_ids=prompt_ids,
     )
     candidate_dir = output_dir / "candidates" / candidate
-    artifact_runtime_provenance = execution["artifact_contract"][
-        "runtime_provenance"
-    ]
+    artifact_runtime_provenance = execution["artifact_contract"]["runtime_provenance"]
     if artifact_runtime_provenance != runtime_provenance.model_dump(mode="json"):
         raise RuntimeError(
             "RWKV-7 runtime provenance drifted during formal candidate execution"
@@ -2028,6 +2337,17 @@ def _low_rank_w8_attention_ignore(base_model_prefix: str) -> str:
     )
 
 
+def _vllm_nvfp4_protection_ablation_ignore(
+    base_model_prefix: str,
+) -> list[str]:
+    escaped_prefix = re.escape(base_model_prefix)
+    return [
+        rf"re:^{escaped_prefix}\.blocks\.0\.att\.value$",
+        rf"re:^{escaped_prefix}\.blocks\.\d+\.ffn\.(?:key|value)$",
+        _HEAD_IGNORE,
+    ]
+
+
 def _require_module(
     parent: torch.nn.Module,
     name: str,
@@ -2096,20 +2416,15 @@ def apply_rwkv7_target_policy(
 
     base_model_prefix, base_model = _resolve_standard_base_model(model)
     attention_ignore = _attention_ignore(base_model_prefix)
-    attention_value_ignore = _attention_value_ignore(base_model_prefix)
-    low_rank_w8_attention_ignore = _low_rank_w8_attention_ignore(
-        base_model_prefix
-    )
+    low_rank_w8_attention_ignore = _low_rank_w8_attention_ignore(base_model_prefix)
     if protection_profile == "critical-high":
         required_ignore = [attention_ignore, _HEAD_IGNORE]
     elif protection_profile == "low-rank-w8-critical-high":
         required_ignore = [low_rank_w8_attention_ignore, _HEAD_IGNORE]
     elif protection_profile == "v-first-dataflow":
-        required_ignore = [attention_value_ignore, _HEAD_IGNORE]
+        required_ignore = _vllm_nvfp4_protection_ablation_ignore(base_model_prefix)
     else:
-        raise ValueError(
-            f"unsupported RWKV-7 protection profile: {protection_profile}"
-        )
+        raise ValueError(f"unsupported RWKV-7 protection profile: {protection_profile}")
     _validate_policy_inputs(
         resolved_targets,
         ignore,
@@ -2136,6 +2451,7 @@ def apply_rwkv7_target_policy(
     other_time_mix_modules: list[str] = []
     later_v_first_tensors: list[str] = []
     low_rank_modules: list[str] = []
+    channel_mix_modules: list[str] = []
     recurrent_state_tensors: list[str] = []
     embedding_modules: list[str] = []
     normalization_modules: list[str] = []
@@ -2244,6 +2560,7 @@ def apply_rwkv7_target_policy(
         for linear_name in ("key", "value"):
             module_path = f"{block_path}.ffn.{linear_name}"
             _require_module(channel_mix, linear_name, torch.nn.Linear, module_path)
+            channel_mix_modules.append(module_path)
             expected_linear_modules.add(module_path)
 
     actual_linear_modules = {
@@ -2260,83 +2577,92 @@ def apply_rwkv7_target_policy(
         )
 
     policy_ignore = list(dict.fromkeys([*ignore, *required_ignore]))
-    excluded_modules = {
-        *first_value_module,
-        *later_value_modules,
-        *later_v_first_linear_modules,
-        *(
-            [*other_time_mix_modules, *low_rank_modules]
-            if protection_profile == "critical-high"
-            else (
-                other_time_mix_modules
-                if protection_profile == "low-rank-w8-critical-high"
-                else []
+    if protection_profile == "critical-high":
+        selected_modules = channel_mix_modules
+    elif protection_profile == "low-rank-w8-critical-high":
+        selected_modules = [*low_rank_modules, *channel_mix_modules]
+    else:
+        selected_modules = _vllm_nvfp4_protection_ablation_targets(
+            base_model_prefix,
+            len(blocks),
+        )
+        missing_ablation_targets = sorted(
+            set(selected_modules) - expected_linear_modules
+        )
+        if missing_ablation_targets:
+            raise ValueError(
+                "RWKV-7 vLLM NVFP4 protection ablation requires the exact "
+                "no-FFN 9+12*(L-1) consumer matrix; "
+                f"missing={missing_ablation_targets}"
             )
+
+    selected_module_set = set(selected_modules)
+
+    def protected_decision(
+        names: list[str],
+        reason: str,
+    ) -> QuantizationTargetPolicyDecision | None:
+        protected_names = [name for name in names if name not in selected_module_set]
+        if not protected_names:
+            return None
+        return QuantizationTargetPolicyDecision(
+            kind="module",
+            names=protected_names,
+            reason=reason,
+        )
+
+    dataflow_module_protections = [
+        protected_decision(
+            first_value_module,
+            "Layer-0 TimeMix value projection produces v_first, which is "
+            "consumed by every later RWKV-7 block.",
         ),
-    }
-    selected_modules = [
-        name
-        for name, module in model.named_modules()
-        if isinstance(module, torch.nn.Linear)
-        and name != _HEAD_IGNORE
-        and name not in excluded_modules
+        protected_decision(
+            later_value_modules,
+            "Later TimeMix value projections outside the declared ablation "
+            "matrix remain high precision.",
+        ),
+        protected_decision(
+            later_v_first_linear_modules,
+            "The v1/v2 Linear modules outside the declared ablation matrix "
+            "remain on the protected v_first path.",
+        ),
+    ]
+    remaining_linear_protections = [
+        protected_decision(
+            other_time_mix_modules,
+            "TimeMix projections outside the candidate-owned target matrix "
+            "remain high precision.",
+        ),
+        protected_decision(
+            low_rank_modules,
+            "Low-rank Linear modules outside the candidate-owned target matrix "
+            "remain high precision.",
+        ),
+        protected_decision(
+            channel_mix_modules,
+            "ChannelMix projections outside the candidate-owned target matrix "
+            "remain high precision.",
+        ),
     ]
     protections = [
-        QuantizationTargetPolicyDecision(
-            kind="module",
-            names=first_value_module,
-            reason=(
-                "Layer-0 TimeMix value projection produces v_first, which is "
-                "consumed by every later RWKV-7 block."
-            ),
-        ),
-        QuantizationTargetPolicyDecision(
-            kind="module",
-            names=later_value_modules,
-            reason=(
-                "Later TimeMix value projections are blended with v_first before "
-                "entering recurrent WKV state updates."
-            ),
-        ),
-        QuantizationTargetPolicyDecision(
-            kind="module",
-            names=later_v_first_linear_modules,
-            reason=(
-                "The v1/v2 Linear modules gate every later layer's dependency on "
-                "v_first and remain high precision in every candidate."
-            ),
-        ),
-        QuantizationTargetPolicyDecision(
-            kind="tensor",
-            names=later_v_first_tensors,
-            reason=(
-                "The v0 tensor gates every later layer's dependency on v_first "
-                "and remains high precision in every candidate."
-            ),
-        ),
+        decision for decision in dataflow_module_protections if decision is not None
     ]
-    if protection_profile in {"critical-high", "low-rank-w8-critical-high"}:
-        protections.append(
+    protections.extend(
+        [
             QuantizationTargetPolicyDecision(
-                kind="module",
-                names=other_time_mix_modules,
+                kind="tensor",
+                names=later_v_first_tensors,
                 reason=(
-                    "Keep the remaining TimeMix projections high precision in "
-                    "critical-high candidates."
+                    "The v0 tensor gates every later layer's dependency on v_first "
+                    "and remains high precision in every candidate."
                 ),
             )
-        )
-    if protection_profile == "critical-high":
-        protections.append(
-            QuantizationTargetPolicyDecision(
-                kind="module",
-                names=low_rank_modules,
-                reason=(
-                    "Keep standard w/a/g low-rank Linear modules high precision "
-                    "in the baseline critical-high candidates."
-                ),
-            )
-        )
+        ]
+    )
+    protections.extend(
+        decision for decision in remaining_linear_protections if decision is not None
+    )
     protections.extend(
         [
             QuantizationTargetPolicyDecision(
@@ -2382,9 +2708,9 @@ def apply_rwkv7_target_policy(
             names=selected_modules,
             reason=(
                 "Select standard RWKV-7 Linear modules resolved by the candidate: "
-                "ChannelMix always, w/a/g low-rank modules for W8 and the "
-                "protection ablation, and non-value TimeMix projections only for "
-                "the ablation; v_first remains high precision."
+                "ChannelMix for critical-high candidates, w/a/g low-rank modules "
+                "for W8, or the exact no-FFN 9+12*(L-1) vLLM NVFP4 consumer "
+                "matrix for the protection ablation."
             ),
         ),
         protections=protections,

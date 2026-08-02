@@ -10,6 +10,7 @@ from llmcompressor.core import State
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.quantization.rwkv7 import (
     QuantizationTargetPolicyMetadata,
+    RWKV7TransformersProvenance,
     apply_rwkv7_target_policy,
     build_rwkv7_quantization_recipe,
 )
@@ -114,6 +115,16 @@ def real_rwkv7_types():
 
 @pytest.fixture(autouse=True)
 def _standard_rwkv7_types(monkeypatch, request):
+    monkeypatch.setattr(
+        "llmcompressor.modifiers.quantization.rwkv7."
+        "validate_rwkv7_transformers_provenance",
+        lambda *_args: RWKV7TransformersProvenance(
+            repository="https://github.com/rwkv-rs/transformers-rwkv.git",
+            revision="2696927df9363b5fa175076bb827ba4da2c4e581",
+            installation_source="editable-git",
+            editable=True,
+        ),
+    )
     if "real_rwkv7_types" in request.fixturenames:
         return
     monkeypatch.setattr(
@@ -182,9 +193,7 @@ def test_rwkv7_policy_selects_channel_mix_and_records_recurrent_protections():
     recorded_names = metadata.selection.names + [
         name for decision in metadata.protections for name in decision.names
     ]
-    assert all(
-        name == "head" or name.startswith("model.") for name in recorded_names
-    )
+    assert all(name == "head" or name.startswith("model.") for name in recorded_names)
 
 
 @pytest.mark.unit
@@ -424,26 +433,38 @@ def test_nvfp4_recipe_survives_second_policy_resolution(
 
 
 @pytest.mark.unit
-def test_protection_ablation_quantizes_non_value_timemix_but_keeps_v_first(
+def test_protection_ablation_exactly_matches_vllm_nvfp4_consumer_matrix(
     real_rwkv7_types,
 ):
-    modifier = build_rwkv7_quantization_recipe(
-        _tiny_standard_rwkv7(), "nvfp4-w4a16-protection-ablation"
-    )
+    model = _tiny_standard_rwkv7()
+    modifier = build_rwkv7_quantization_recipe(model, "nvfp4-w4a16-protection-ablation")
     metadata = modifier.target_policy_metadata
 
     assert modifier.ignore == [
-        r"re:^model\.blocks\.\d+\.att\.(value|v1|v2)$",
+        r"re:^model\.blocks\.0\.att\.value$",
+        r"re:^model\.blocks\.\d+\.ffn\.(?:key|value)$",
         "head",
     ]
-    assert "model.blocks.0.att.value" not in metadata.selection.names
-    assert "model.blocks.1.att.value" not in metadata.selection.names
-    assert "model.blocks.0.att.receptance" in metadata.selection.names
-    assert "model.blocks.1.att.output" in metadata.selection.names
-    assert "model.blocks.0.att.w1" in metadata.selection.names
-    assert "model.blocks.1.att.g2" in metadata.selection.names
-    assert "model.blocks.1.att.v1" not in metadata.selection.names
-    assert "model.blocks.1.att.v2" not in metadata.selection.names
+    assert metadata.selection.names == [
+        *(
+            f"model.blocks.0.att.{name}"
+            for name in ("w1", "w2", "a1", "a2", "g1", "g2")
+        ),
+        *(f"model.blocks.0.att.{name}" for name in ("receptance", "key", "output")),
+        *(
+            f"model.blocks.1.att.{name}"
+            for name in ("w1", "w2", "a1", "a2", "v1", "v2", "g1", "g2")
+        ),
+        *(
+            f"model.blocks.1.att.{name}"
+            for name in ("receptance", "key", "value", "output")
+        ),
+    ]
+    assert len(metadata.selection.names) == 9 + 12 * (2 - 1)
+    assert not any(".ffn." in name for name in metadata.selection.names)
+    assert [
+        name for name, _ in match_named_modules(model, {"Linear"}, modifier.ignore)
+    ] == metadata.selection.names
     protected_modules = {
         name
         for decision in metadata.protections
@@ -452,11 +473,11 @@ def test_protection_ablation_quantizes_non_value_timemix_but_keeps_v_first(
     }
     assert {
         "model.blocks.0.att.value",
-        "model.blocks.1.att.value",
-        "model.blocks.1.att.v1",
-        "model.blocks.1.att.v2",
+        "model.blocks.0.ffn.key",
+        "model.blocks.1.ffn.value",
         "head",
     } <= protected_modules
+    assert set(metadata.selection.names).isdisjoint(protected_modules)
     protected_tensors = {
         name
         for decision in metadata.protections

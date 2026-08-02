@@ -98,6 +98,7 @@ def _run_fresh_process_load(model_path, *, compressed: bool):
     if compressed:
         provenance_import = """
 from llmcompressor.modifiers.quantization.rwkv7 import (
+    RWKV7ArtifactContract,
     RWKV7RepositoryContract,
     validate_rwkv7_transformers_provenance,
 )
@@ -106,14 +107,14 @@ from llmcompressor.modifiers.quantization.rwkv7 import (
 with open(f'{sys.argv[1]}/config.json', encoding='utf-8') as config_handle:
     serialized_config = json.load(config_handle)
 contract = serialized_config['rwkv7_quantization_metadata']
+contract = RWKV7ArtifactContract.model_validate(contract).model_dump(mode='json')
 validate_rwkv7_transformers_provenance(
     RWKV7RepositoryContract.model_validate(contract['repository'])
 )
 transformers_provenance_validated = True
 """
         quantization_import = (
-            "from transformers.utils.quantization_config import "
-            "CompressedTensorsConfig"
+            "from transformers.utils.quantization_config import CompressedTensorsConfig"
         )
         quantization_argument = (
             "quantization_config=CompressedTensorsConfig(dequantize=True),"
@@ -124,6 +125,11 @@ missing = sorted(
     & set(loading_info['missing_keys'])
 )
 assert not missing, missing
+missing_protected = sorted(
+    set(contract['vllm']['protected_parameter_keys'])
+    & set(loading_info['missing_keys'])
+)
+assert not missing_protected, missing_protected
 quantized_low_rank = [
     model.get_submodule(name)
     for name in contract['vllm']['quantized_low_rank_modules']
@@ -131,6 +137,10 @@ quantized_low_rank = [
 protected_v_first = [
     model.get_submodule(name)
     for name in contract['vllm']['protected_v_first_linear_modules']
+]
+protected_parameters = [
+    model.get_parameter(name)
+    for name in contract['vllm']['protected_parameter_keys']
 ]
 assert all(
     getattr(module, 'quantization_scheme', None) is not None
@@ -143,12 +153,14 @@ assert all(
 )
 quantized_low_rank_count = len(quantized_low_rank)
 protected_v_first_count = len(protected_v_first)
+protected_parameter_count = len(protected_parameters)
 """
     else:
         contract_checks = """
 missing = []
 quantized_low_rank_count = 0
 protected_v_first_count = 0
+protected_parameter_count = 0
 """
 
     script = f"""
@@ -184,6 +196,7 @@ print(json.dumps({{
     'missing_quantized_weights': missing,
     'quantized_low_rank_module_count': quantized_low_rank_count,
     'protected_v_first_linear_module_count': protected_v_first_count,
+    'protected_parameter_count': protected_parameter_count,
     'transformers_provenance_validated': transformers_provenance_validated,
 }}))
 """
@@ -210,12 +223,8 @@ def test_rwkv7_transformers_provenance_delegates_operator_gate(monkeypatch):
     provenance = validate_rwkv7_transformers_provenance()
 
     assert calls == ["called"]
-    assert provenance.repository == (
-        "https://github.com/rwkv-rs/transformers-rwkv.git"
-    )
-    assert provenance.revision == (
-        "2696927df9363b5fa175076bb827ba4da2c4e581"
-    )
+    assert provenance.repository == ("https://github.com/rwkv-rs/transformers-rwkv.git")
+    assert provenance.revision == ("2696927df9363b5fa175076bb827ba4da2c4e581")
     assert provenance.installation_source == "editable-git"
     assert provenance.editable is True
     assert provenance.operator_runtime == dict(
@@ -251,8 +260,7 @@ def test_rwkv7_editable_provenance_rejects_repo_local_shadow_module(
 
     repository_root = tmp_path / "transformers-rwkv"
     shadow_module = (
-        repository_root
-        / ".venv/lib/python3.12/site-packages/transformers/__init__.py"
+        repository_root / ".venv/lib/python3.12/site-packages/transformers/__init__.py"
     )
     shadow_module.parent.mkdir(parents=True)
     shadow_module.write_text("", encoding="utf-8")
@@ -434,8 +442,7 @@ def test_rwkv7_transformers_provenance_rejects_registry_install(monkeypatch):
             return None
 
     monkeypatch.setattr(
-        "llmcompressor.modifiers.quantization.rwkv7."
-        "importlib_metadata.distribution",
+        "llmcompressor.modifiers.quantization.rwkv7.importlib_metadata.distribution",
         lambda name: _RegistryDistribution(),
     )
 
@@ -457,9 +464,7 @@ def test_rwkv7_transformers_provenance_rejects_unpinned_vcs_request(monkeypatch)
                     "vcs_info": {
                         "vcs": "git",
                         "requested_revision": "main",
-                        "commit_id": (
-                            "2696927df9363b5fa175076bb827ba4da2c4e581"
-                        ),
+                        "commit_id": ("2696927df9363b5fa175076bb827ba4da2c4e581"),
                     },
                 }
             )
@@ -470,8 +475,7 @@ def test_rwkv7_transformers_provenance_rejects_unpinned_vcs_request(monkeypatch)
             return transformers.__file__
 
     monkeypatch.setattr(
-        "llmcompressor.modifiers.quantization.rwkv7."
-        "importlib_metadata.distribution",
+        "llmcompressor.modifiers.quantization.rwkv7.importlib_metadata.distribution",
         lambda name: _BranchVcsDistribution(),
     )
 
@@ -482,8 +486,7 @@ def test_rwkv7_transformers_provenance_rejects_unpinned_vcs_request(monkeypatch)
 @pytest.mark.unit
 def test_rwkv7_transformers_provenance_rejects_revision_drift(monkeypatch):
     monkeypatch.setattr(
-        "llmcompressor.modifiers.quantization.rwkv7."
-        "_installed_transformers_provenance",
+        "llmcompressor.modifiers.quantization.rwkv7._installed_transformers_provenance",
         lambda: RWKV7TransformersProvenance(
             repository="https://github.com/rwkv-rs/transformers-rwkv.git",
             revision="0" * 40,
@@ -525,8 +528,7 @@ def test_artifact_contract_pins_fork_standard_names_and_v_first_protection(
     )
     assert contract.runtime_provenance == _runtime_provenance()
     assert (
-        contract.target_policy.recipe.runtime_provenance
-        == contract.runtime_provenance
+        contract.target_policy.recipe.runtime_provenance == contract.runtime_provenance
     )
     assert contract.checkpoint.sha256 == (
         "737079d81865801fd85e5459488d89a36d5304a524e890244eb83d44f531c89c"
@@ -537,18 +539,36 @@ def test_artifact_contract_pins_fork_standard_names_and_v_first_protection(
     assert contract.vllm.linear_weight_suffix == "weight"
     assert contract.vllm.linear_weight_layout == "out-in"
     assert contract.vllm.legacy_pth_direct_load is False
-    assert contract.vllm.layer_zero_v_first_producer == (
-        "model.blocks.0.att.value"
+    assert contract.vllm.consumer_capabilities == [
+        "transformers-rwkv-compressed-tensors"
+    ]
+    assert contract.vllm.vllm_consumer_requirement == ("vllm-rwkv-nvfp4-w4a4")
+    assert contract.vllm.vllm_consumer_revision is None
+    assert contract.vllm.target_schema_version == 1
+    assert contract.vllm.target_schema == "rwkv7-nvfp4-critical-high-v1"
+    assert contract.vllm.num_hidden_layers == 2
+    assert (
+        contract.vllm.quantized_target_fqns_digest
+        == hashlib.sha256(
+            json.dumps(
+                contract.vllm.quantized_modules,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
     )
+    assert contract.vllm.layer_zero_v_first_producer == ("model.blocks.0.att.value")
     assert contract.vllm.protected_embedding_modules == ["model.embeddings"]
     assert "head" in contract.vllm.protected_linear_modules
     assert "model.blocks.0.ln0" in contract.vllm.protected_normalization_modules
-    assert "model.blocks.1.ln0" not in (
-        contract.vllm.protected_normalization_modules
-    )
+    assert "model.blocks.1.ln0" not in (contract.vllm.protected_normalization_modules)
     assert "model.blocks.0.att.value" in contract.vllm.protected_modules
     assert "model.blocks.1.att.v0" in contract.vllm.protected_tensors
     assert "model.blocks.0.ffn.x_k" in contract.vllm.protected_state_tensors
+    assert {
+        "model.blocks.0.ln1.bias",
+        "model.blocks.0.att.ln_x.bias",
+    } <= set(contract.vllm.protected_parameter_keys)
     assert contract.vllm.quantized_modules == [
         "model.blocks.0.ffn.key",
         "model.blocks.0.ffn.value",
@@ -558,6 +578,49 @@ def test_artifact_contract_pins_fork_standard_names_and_v_first_protection(
     assert contract.formal_checkpoint is True
     assert contract.formal_evaluation is False
     assert contract.target_policy.recipe.quantization_applied is True
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("candidate", "target_schema"),
+    [
+        ("nvfp4-w4a16", "rwkv7-nvfp4-critical-high-v1"),
+        (
+            "nvfp4-w4a16-protection-ablation",
+            "rwkv7-nvfp4-protection-ablation-no-ffn-v1",
+        ),
+    ],
+)
+def test_w4a16_artifact_declares_exact_vllm_capability_and_target_schema(
+    monkeypatch,
+    candidate,
+    target_schema,
+):
+    monkeypatch.setattr(
+        rwkv7_module,
+        "validate_rwkv7_transformers_provenance",
+        _runtime_provenance,
+    )
+    modifier = build_rwkv7_quantization_recipe(_tiny_standard_rwkv7(), candidate)
+    contract = build_rwkv7_artifact_contract(
+        modifier.target_policy_metadata,
+        candidate,
+    )
+
+    assert contract.vllm.consumer_capabilities == [
+        "transformers-rwkv-compressed-tensors",
+        "vllm-rwkv-nvfp4-w4a16",
+    ]
+    assert contract.vllm.vllm_consumer_requirement == ("vllm-rwkv-nvfp4-w4a16")
+    assert contract.vllm.vllm_consumer_revision == (
+        "88b992bbc73e8b904ae672dfd39396b6dd0d6ea4"
+    )
+    assert contract.vllm.target_schema == target_schema
+    if candidate == "nvfp4-w4a16-protection-ablation":
+        assert len(contract.vllm.quantized_modules) == 9 + 12 * (2 - 1)
+        assert not any(".ffn." in name for name in contract.vllm.quantized_modules)
+        assert contract.vllm.quantized_modules[8] == ("model.blocks.0.att.output")
+        assert contract.vllm.quantized_modules[9] == "model.blocks.1.att.w1"
 
 
 @pytest.fixture
@@ -581,6 +644,12 @@ def standard_linear_w8_artifact(tmp_path, monkeypatch):
         "w8a16-low-rank-critical-high",
     )
     assert contract.vllm.quantization_format == "pack-quantized"
+    assert contract.vllm.consumer_capabilities == [
+        "transformers-rwkv-compressed-tensors"
+    ]
+    assert contract.vllm.vllm_consumer_requirement is None
+    assert contract.vllm.vllm_consumer_revision is None
+    assert contract.vllm.target_schema == ("rwkv7-w8-low-rank-critical-high-v1")
     channel_mix_modules = [
         "model.blocks.0.ffn.key",
         "model.blocks.0.ffn.value",
@@ -596,11 +665,13 @@ def standard_linear_w8_artifact(tmp_path, monkeypatch):
         [*channel_mix_modules, *low_rank_modules]
     )
     assert contract.vllm.quantized_low_rank_modules == low_rank_modules
-    assert contract.vllm.low_rank_linear_modules == sorted(low_rank_modules)
     assert contract.vllm.protected_v_first_linear_modules == [
         "model.blocks.1.att.v1",
         "model.blocks.1.att.v2",
     ]
+    assert contract.vllm.low_rank_linear_modules == sorted(
+        [*low_rank_modules, *contract.vllm.protected_v_first_linear_modules]
+    )
     assert contract.vllm.quantized_weight_names == [
         f"{name}.weight" for name in contract.vllm.quantized_modules
     ]
@@ -636,10 +707,6 @@ def standard_linear_w8_artifact(tmp_path, monkeypatch):
         Event(type_=EventType.CALIBRATION_END),
     )
     result = model
-    with torch.inference_mode():
-        logits = result(torch.tensor([[1, 2, 3]]), use_cache=True).logits
-    assert logits.shape == (1, 3, 32)
-    assert torch.isfinite(logits).all()
     for name, tensor in protected_before.items():
         assert torch.equal(result.get_submodule(name).weight, tensor)
 
@@ -670,9 +737,12 @@ def standard_linear_w8_artifact(tmp_path, monkeypatch):
     assert serialized_config["quantization_config"]["quantization_status"] == (
         "compressed"
     )
-    assert serialized_config["rwkv7_quantization_metadata"]["target_policy"][
-        "recipe"
-    ]["quantization_applied"] is True
+    assert (
+        serialized_config["rwkv7_quantization_metadata"]["target_policy"]["recipe"][
+            "quantization_applied"
+        ]
+        is True
+    )
 
     return tmp_path, contract, audit
 
@@ -703,9 +773,8 @@ def test_audit_uses_complete_serialized_contract_without_external_copy(
     )
 
     assert audit["artifact_contract_serialized"] is True
-    assert audit["protected_tensor_count"] == (
-        len(contract.vllm.protected_tensors)
-        + len(contract.vllm.protected_modules)
+    assert audit["protected_parameter_count"] == len(
+        contract.vllm.protected_parameter_keys
     )
 
 
@@ -722,15 +791,25 @@ def test_audit_rejects_partial_target_inventory(standard_linear_w8_artifact):
 
 
 @pytest.mark.integration
-def test_audit_rejects_missing_protected_physical_tensor(
+@pytest.mark.parametrize(
+    "parameter_name",
+    [
+        "model.blocks.0.ln1.bias",
+        "model.blocks.0.att.ln_x.bias",
+    ],
+    ids=["layer-norm-bias", "group-norm-bias"],
+)
+def test_audit_rejects_missing_protected_normalization_bias_before_runtime(
     standard_linear_w8_artifact,
+    parameter_name,
 ):
     from safetensors.torch import load_file, save_file
 
     artifact_path, contract, _ = standard_linear_w8_artifact
+    assert parameter_name in contract.vllm.protected_parameter_keys
     shard = artifact_path / "model.safetensors"
     tensors = load_file(shard)
-    tensors.pop(contract.vllm.protected_tensors[0])
+    tensors.pop(parameter_name)
     save_file(tensors, shard)
 
     with pytest.raises(RuntimeError, match="missing protected physical tensors"):
@@ -741,6 +820,77 @@ def test_audit_rejects_missing_protected_physical_tensor(
         )
 
 
+@pytest.mark.unit
+def test_artifact_contract_rejects_incomplete_protected_parameter_inventory(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        rwkv7_module,
+        "validate_rwkv7_transformers_provenance",
+        _runtime_provenance,
+    )
+    modifier = build_rwkv7_quantization_recipe(_tiny_standard_rwkv7())
+    contract = build_rwkv7_artifact_contract(
+        modifier.target_policy_metadata,
+        "nvfp4-w4a4",
+    ).model_dump(mode="json")
+    contract["vllm"]["protected_parameter_keys"].remove("model.blocks.0.ln1.bias")
+
+    with pytest.raises(ValueError, match="protected parameter inventory"):
+        RWKV7ArtifactContract.model_validate(contract)
+
+
+@pytest.mark.unit
+def test_artifact_contract_rejects_quantized_target_digest_tamper(monkeypatch):
+    monkeypatch.setattr(
+        rwkv7_module,
+        "validate_rwkv7_transformers_provenance",
+        _runtime_provenance,
+    )
+    modifier = build_rwkv7_quantization_recipe(
+        _tiny_standard_rwkv7(),
+        "nvfp4-w4a16-protection-ablation",
+    )
+    contract = build_rwkv7_artifact_contract(
+        modifier.target_policy_metadata,
+        "nvfp4-w4a16-protection-ablation",
+    ).model_dump(mode="json")
+    contract["vllm"]["quantized_target_fqns_digest"] = "0" * 64
+
+    with pytest.raises(ValueError, match="FQN digest"):
+        RWKV7ArtifactContract.model_validate(contract)
+
+
+@pytest.mark.unit
+def test_ablation_loader_metadata_rejects_ffn_target_injection(monkeypatch):
+    monkeypatch.setattr(
+        rwkv7_module,
+        "validate_rwkv7_transformers_provenance",
+        _runtime_provenance,
+    )
+    modifier = build_rwkv7_quantization_recipe(
+        _tiny_standard_rwkv7(),
+        "nvfp4-w4a16-protection-ablation",
+    )
+    loader_metadata = build_rwkv7_artifact_contract(
+        modifier.target_policy_metadata,
+        "nvfp4-w4a16-protection-ablation",
+    ).vllm
+    tampered = loader_metadata.model_dump(mode="json")
+    tampered["quantized_modules"].append("model.blocks.0.ffn.key")
+    tampered["quantized_weight_names"].append("model.blocks.0.ffn.key.weight")
+    tampered["quantized_target_fqns_digest"] = hashlib.sha256(
+        json.dumps(
+            tampered["quantized_modules"],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+    with pytest.raises(ValueError, match="exact expanded target schema"):
+        type(loader_metadata).model_validate(tampered)
+
+
 @pytest.mark.integration
 def test_compressed_artifact_rejects_unapplied_recipe_metadata(
     standard_linear_w8_artifact,
@@ -749,9 +899,7 @@ def test_compressed_artifact_rejects_unapplied_recipe_metadata(
     config_path = artifact_path / "config.json"
     serialized_config = json.loads(config_path.read_text(encoding="utf-8"))
     serialized_contract = serialized_config["rwkv7_quantization_metadata"]
-    serialized_contract["target_policy"]["recipe"][
-        "quantization_applied"
-    ] = False
+    serialized_contract["target_policy"]["recipe"]["quantization_applied"] = False
 
     with pytest.raises(ValueError, match="must record applied quantization"):
         RWKV7ArtifactContract.model_validate(serialized_contract)
@@ -801,6 +949,7 @@ def test_standard_rwkv7_unquantized_fresh_process_forward_and_generate(tmp_path)
         "missing_quantized_weights": [],
         "quantized_low_rank_module_count": 0,
         "protected_v_first_linear_module_count": 0,
+        "protected_parameter_count": 0,
         "transformers_provenance_validated": False,
     }
 
@@ -823,6 +972,7 @@ def test_low_rank_w8_fresh_process_public_load_forward_and_generate(
         "missing_quantized_weights": [],
         "quantized_low_rank_module_count": 12,
         "protected_v_first_linear_module_count": 2,
+        "protected_parameter_count": 53,
         "transformers_provenance_validated": True,
     }
 
