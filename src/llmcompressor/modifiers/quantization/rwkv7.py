@@ -228,6 +228,15 @@ def audit_rwkv7_quantized_checkpoint(
         or quantization.get("format") != expected_format
     ):
         raise RuntimeError("RWKV-7 checkpoint lacks compressed NVFP4 metadata")
+    groups = quantization.get("config_groups", {})
+    if not isinstance(groups, dict) or len(groups) != 1:
+        raise RuntimeError("RWKV-7 checkpoint has an invalid quantization config group")
+    group = next(iter(groups.values()))
+    input_quantized = group.get("input_activations") is not None
+    if input_quantized != (candidate == "nvfp4-w4a4"):
+        raise RuntimeError(
+            "RWKV-7 checkpoint activation quantization differs from candidate"
+        )
     tensors: dict[str, tuple[list[int], str]] = {}
     for shard in sorted(output_dir.glob("*.safetensors")):
         with safe_open(shard, framework="pt", device="cpu") as handle:
@@ -244,6 +253,10 @@ def audit_rwkv7_quantized_checkpoint(
         }
         if candidate == "nvfp4-w4a4":
             required.add(f"{target}.input_global_scale")
+        elif f"{target}.input_global_scale" in tensors:
+            raise RuntimeError(
+                f"W4A16 target unexpectedly quantized its input: {target}"
+            )
         missing = sorted(required - tensors.keys())
         if missing or f"{target}.weight" in tensors:
             raise RuntimeError(
@@ -268,6 +281,7 @@ def audit_rwkv7_quantized_checkpoint(
         "targets": expected_targets,
         "protected_tensor_count": len(protected),
         "tensor_count": len(tensors),
+        "input_quantized": input_quantized,
     }
 
 
@@ -294,6 +308,7 @@ def quantize_rwkv7_oneshot(
     calibration_dataset: object | None,
     processor: object | None,
     candidates: tuple[str, ...] = ("nvfp4-w4a4", "nvfp4-w4a16"),
+    forced_candidate: str | None = None,
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
     """Execute the closed candidate order through standard ``oneshot``."""
     from llmcompressor import oneshot
@@ -302,8 +317,13 @@ def quantize_rwkv7_oneshot(
         raise ValueError(
             "RWKV-7 quantization execution requires the closed candidate order"
         )
+    if forced_candidate is not None and forced_candidate not in _CANDIDATE_SCHEMES:
+        raise ValueError(f"unsupported forced RWKV-7 candidate: {forced_candidate}")
+    execution_candidates = (
+        candidates if forced_candidate is None else (forced_candidate,)
+    )
     failures = []
-    for candidate in candidates:
+    for candidate in execution_candidates:
         model = model_factory()
         modifier = build_rwkv7_quantization_recipe(model, candidate)
         destination = output_dir / candidate
@@ -380,6 +400,7 @@ assert torch.isfinite(logits).all()
             "schema_version": 1,
             "candidate": candidate,
             "candidate_order": list(candidates),
+            "forced_candidate": forced_candidate,
             "quantization_applied": True,
             "audit": audit,
             "cell_forward": {
@@ -391,6 +412,11 @@ assert torch.isfinite(logits).all()
                 "passed": reload_run.returncode == 0,
                 "returncode": reload_run.returncode,
                 "stderr": reload_run.stderr[-8000:],
+                "source_owner": "Transformers RWKV7 loader",
+                "regression_expectation": (
+                    "compressed Linear modules without weight must bypass "
+                    "Rwkv7PreTrainedModel._init_weights"
+                ),
             },
             "failures": failures,
         }
