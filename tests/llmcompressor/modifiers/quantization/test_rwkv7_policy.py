@@ -55,6 +55,7 @@ class _TimeMix(torch.nn.Module):
         self.key = torch.nn.Linear(hidden_size, hidden_size, bias=False)
         self.value = torch.nn.Linear(hidden_size, hidden_size, bias=False)
         self.output = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+        self.ln_x = torch.nn.GroupNorm(1, hidden_size)
 
 
 class _ChannelMix(torch.nn.Module):
@@ -68,6 +69,12 @@ class _ChannelMix(torch.nn.Module):
 class _Block(torch.nn.Module):
     def __init__(self, layer_id: int, hidden_size: int):
         super().__init__()
+        if layer_id == 0:
+            self.ln0 = torch.nn.LayerNorm(hidden_size)
+        else:
+            self.ln0 = torch.nn.Identity()
+        self.ln1 = torch.nn.LayerNorm(hidden_size)
+        self.ln2 = torch.nn.LayerNorm(hidden_size)
         self.att = _TimeMix(layer_id, hidden_size)
         self.ffn = _ChannelMix(hidden_size)
 
@@ -76,12 +83,14 @@ class _Rwkv7Model(torch.nn.Module):
     def __init__(self, config: _Rwkv7Config, hidden_size: int):
         super().__init__()
         self.config = config
+        self.embeddings = torch.nn.Embedding(hidden_size, hidden_size)
         self.blocks = torch.nn.ModuleList(
             [
                 _Block(layer_id, hidden_size)
                 for layer_id in range(config.num_hidden_layers)
             ]
         )
+        self.ln_out = torch.nn.LayerNorm(hidden_size)
 
 
 class _Rwkv7ForCausalLM(torch.nn.Module):
@@ -157,12 +166,24 @@ def test_rwkv7_policy_selects_channel_mix_and_records_recurrent_protections():
     recurrent = metadata.protections[-1]
     assert recurrent.kind == "tensor"
     assert "model.blocks.0.att.x_r" in recurrent.names
+    assert "model.blocks.0.ffn.x_k" in recurrent.names
     assert "model.blocks.1.att.r_k" in recurrent.names
+    assert "model.blocks.1.ffn.x_k" in recurrent.names
+    protected_modules = {
+        name
+        for decision in metadata.protections
+        if decision.kind == "module"
+        for name in decision.names
+    }
+    assert "model.embeddings" in protected_modules
+    assert "model.ln_out" in protected_modules
+    assert "model.blocks.0.ln0" in protected_modules
+    assert "model.blocks.1.att.ln_x" in protected_modules
     recorded_names = metadata.selection.names + [
         name for decision in metadata.protections for name in decision.names
     ]
     assert all(
-        name == "head" or name.startswith("model.blocks.") for name in recorded_names
+        name == "head" or name.startswith("model.") for name in recorded_names
     )
 
 
@@ -200,6 +221,24 @@ def test_rwkv7_policy_decision_table_fails_closed(mutation, error_match):
 
     with pytest.raises(ValueError, match=error_match):
         _apply_policy(model)
+
+
+@pytest.mark.unit
+def test_rwkv7_policy_accepts_fused_embedding_norm_identity():
+    model = _Rwkv7ForCausalLM()
+    model.config.embedding_layer_norm_fused = True
+    model.model.blocks[0].ln0 = torch.nn.Identity()
+
+    _, metadata = _apply_policy(model)
+
+    protected_modules = {
+        name
+        for decision in metadata.protections
+        if decision.kind == "module"
+        for name in decision.names
+    }
+    assert "model.embeddings" in protected_modules
+    assert "model.blocks.0.ln0" not in protected_modules
 
 
 @pytest.mark.unit
@@ -270,6 +309,8 @@ def _tiny_standard_rwkv7():
         "input_dtype",
         "input_scale",
         "protection_profile",
+        "candidate_role",
+        "runtime_requirement",
     ),
     [
         (
@@ -280,6 +321,8 @@ def _tiny_standard_rwkv7():
             "float4",
             "dynamic_local",
             "critical-high",
+            "nvfp4-primary",
+            "blackwell-sm120",
         ),
         (
             "nvfp4-w4a16",
@@ -289,6 +332,8 @@ def _tiny_standard_rwkv7():
             "float16",
             "none",
             "critical-high",
+            "nvfp4-weight-only-baseline",
+            "blackwell-sm120",
         ),
         (
             "nvfp4-w4a16-protection-ablation",
@@ -298,6 +343,8 @@ def _tiny_standard_rwkv7():
             "float16",
             "none",
             "v-first-dataflow",
+            "nvfp4-protection-ablation",
+            "blackwell-sm120",
         ),
         (
             "w8a16-low-rank-critical-high",
@@ -307,6 +354,8 @@ def _tiny_standard_rwkv7():
             "float16",
             "none",
             "low-rank-w8-critical-high",
+            "low-rank-w8-diagnostic",
+            "portable-int8",
         ),
     ],
 )
@@ -318,6 +367,8 @@ def test_tiny_standard_rwkv7_builds_closed_candidate_recipe(
     input_dtype,
     input_scale,
     protection_profile,
+    candidate_role,
+    runtime_requirement,
     real_rwkv7_types,
 ):
     model = _tiny_standard_rwkv7()
@@ -337,10 +388,39 @@ def test_tiny_standard_rwkv7_builds_closed_candidate_recipe(
     assert loader.input_dtype == input_dtype
     assert loader.input_scale == input_scale
     assert loader.protection_profile == protection_profile
+    assert loader.candidate_role == candidate_role
+    assert loader.runtime_requirement == runtime_requirement
     assert modifier.target_policy_metadata.protection_profile == protection_profile
     assert loader.targets == modifier.target_policy_metadata.selection.names
     assert loader.quantization_applied is False
     assert not any(hasattr(module, "quantization_scheme") for module in model.modules())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        "nvfp4-w4a4",
+        "nvfp4-w4a16",
+        "nvfp4-w4a16-protection-ablation",
+    ],
+)
+def test_nvfp4_recipe_survives_second_policy_resolution(
+    candidate,
+    real_rwkv7_types,
+):
+    model = _tiny_standard_rwkv7()
+    modifier = build_rwkv7_quantization_recipe(model, candidate)
+    recipe = modifier.target_policy_metadata.recipe
+    state = State()
+    state.update(model=model, device="cpu")
+
+    modifier.on_initialize(state)
+
+    assert modifier.target_policy_metadata.recipe == recipe
+    assert modifier.target_policy_metadata.recipe.targets == (
+        modifier.target_policy_metadata.selection.names
+    )
 
 
 @pytest.mark.unit

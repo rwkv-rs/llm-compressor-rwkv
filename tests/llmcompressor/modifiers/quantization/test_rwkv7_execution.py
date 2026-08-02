@@ -184,8 +184,8 @@ def test_gb10_real_nvfp4_checkpoint_has_packed_tensors_and_forward(
     assert reload_evidence["dtype"] == "torch.bfloat16"
     assert reload_evidence["logits_dtype"] == "torch.bfloat16"
     assert reload_evidence["quantized_module_count"] == 4
-    assert reload_evidence["protected_module_count"] == 23
-    assert reload_evidence["protected_tensor_count"] == 23
+    assert reload_evidence["protected_module_count"] == 32
+    assert reload_evidence["protected_tensor_count"] == 25
     assert reload_evidence["artifact_contract_validated"] is True
     runtime = reload_evidence["runtime_measurement"]
     assert runtime["scope"] == "fresh-process-transformers-generate-diagnostic"

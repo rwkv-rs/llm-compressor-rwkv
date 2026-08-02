@@ -148,11 +148,22 @@ def test_artifact_contract_pins_fork_standard_names_and_v_first_protection():
     )
     assert contract.vllm.architecture == "Rwkv7ForCausalLM"
     assert contract.vllm.embedding_name == "model.embeddings.weight"
+    assert contract.vllm.quantization_target_type == "Linear"
     assert contract.vllm.linear_weight_suffix == "weight"
     assert contract.vllm.linear_weight_layout == "out-in"
     assert contract.vllm.legacy_pth_direct_load is False
+    assert contract.vllm.layer_zero_v_first_producer == (
+        "model.blocks.0.att.value"
+    )
+    assert contract.vllm.protected_embedding_modules == ["model.embeddings"]
+    assert "head" in contract.vllm.protected_linear_modules
+    assert "model.blocks.0.ln0" in contract.vllm.protected_normalization_modules
+    assert "model.blocks.1.ln0" not in (
+        contract.vllm.protected_normalization_modules
+    )
     assert "model.blocks.0.att.value" in contract.vllm.protected_modules
     assert "model.blocks.1.att.v0" in contract.vllm.protected_tensors
+    assert "model.blocks.0.ffn.x_k" in contract.vllm.protected_state_tensors
     assert contract.vllm.quantized_modules == [
         "model.blocks.0.ffn.key",
         "model.blocks.0.ffn.value",

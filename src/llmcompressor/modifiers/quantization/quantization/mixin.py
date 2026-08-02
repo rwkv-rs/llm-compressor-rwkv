@@ -269,6 +269,11 @@ class QuantizationMixin(HooksMixin):
             return
 
         if self.target_policy == "rwkv7":
+            existing_recipe = (
+                self.target_policy_metadata.recipe
+                if self.target_policy_metadata is not None
+                else None
+            )
             policy_ignore, metadata = apply_rwkv7_target_policy(
                 model=model,
                 resolved_targets=self.resolved_targets,
@@ -276,6 +281,19 @@ class QuantizationMixin(HooksMixin):
                 kv_cache_enabled=self.kv_cache_scheme is not None,
                 protection_profile=self.target_policy_profile,
             )
+            if existing_recipe is not None:
+                if (
+                    existing_recipe.targets != metadata.selection.names
+                    or existing_recipe.protection_profile
+                    != metadata.protection_profile
+                ):
+                    raise ValueError(
+                        "RWKV-7 resolved target policy drifted from its candidate "
+                        "recipe"
+                    )
+                metadata = metadata.model_copy(
+                    update={"recipe": existing_recipe}
+                )
             self.ignore = policy_ignore
             self.target_policy_metadata = metadata
             self._resolved_config = None

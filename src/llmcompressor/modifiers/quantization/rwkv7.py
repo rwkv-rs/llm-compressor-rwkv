@@ -58,18 +58,26 @@ _CANDIDATE_SPECS = {
     "nvfp4-w4a4": {
         "scheme": "NVFP4",
         "protection_profile": "critical-high",
+        "candidate_role": "nvfp4-primary",
+        "runtime_requirement": "blackwell-sm120",
     },
     "nvfp4-w4a16": {
         "scheme": "NVFP4A16",
         "protection_profile": "critical-high",
+        "candidate_role": "nvfp4-weight-only-baseline",
+        "runtime_requirement": "blackwell-sm120",
     },
     "nvfp4-w4a16-protection-ablation": {
         "scheme": "NVFP4A16",
         "protection_profile": "v-first-dataflow",
+        "candidate_role": "nvfp4-protection-ablation",
+        "runtime_requirement": "blackwell-sm120",
     },
     "w8a16-low-rank-critical-high": {
         "scheme": "W8A16",
         "protection_profile": "low-rank-w8-critical-high",
+        "candidate_role": "low-rank-w8-diagnostic",
+        "runtime_requirement": "portable-int8",
     },
 }
 _CANDIDATE_SCHEMES = {
@@ -168,6 +176,7 @@ class RWKV7VLLMLoaderMetadata(BaseModel):
     output_norm_prefix: Literal["model.ln_out."] = "model.ln_out."
     head_name: Literal["head.weight"] = "head.weight"
     legacy_pth_direct_load: Literal[False] = False
+    quantization_target_type: Literal["Linear"] = "Linear"
     linear_weight_suffix: Literal["weight"] = "weight"
     linear_weight_layout: Literal["out-in"] = "out-in"
     quantized_modules: list[str]
@@ -175,6 +184,11 @@ class RWKV7VLLMLoaderMetadata(BaseModel):
     low_rank_linear_modules: list[str]
     quantized_low_rank_modules: list[str]
     protected_v_first_linear_modules: list[str]
+    layer_zero_v_first_producer: str
+    protected_linear_modules: list[str]
+    protected_embedding_modules: list[str]
+    protected_normalization_modules: list[str]
+    protected_state_tensors: list[str]
     protected_modules: list[str]
     protected_tensors: list[str]
 
@@ -188,6 +202,12 @@ class RWKV7VLLMLoaderMetadata(BaseModel):
             "protected_v_first_linear_modules": (
                 self.protected_v_first_linear_modules
             ),
+            "protected_linear_modules": self.protected_linear_modules,
+            "protected_embedding_modules": self.protected_embedding_modules,
+            "protected_normalization_modules": (
+                self.protected_normalization_modules
+            ),
+            "protected_state_tensors": self.protected_state_tensors,
             "protected_modules": self.protected_modules,
             "protected_tensors": self.protected_tensors,
         }
@@ -203,11 +223,30 @@ class RWKV7VLLMLoaderMetadata(BaseModel):
             )
         quantized = set(self.quantized_modules)
         protected = set(self.protected_modules)
+        protected_linear = set(self.protected_linear_modules)
+        protected_embedding = set(self.protected_embedding_modules)
+        protected_normalization = set(self.protected_normalization_modules)
         low_rank = set(self.low_rank_linear_modules)
         quantized_low_rank = set(self.quantized_low_rank_modules)
         protected_v_first = set(self.protected_v_first_linear_modules)
         if quantized & protected:
             raise ValueError("RWKV-7 vLLM quantized and protected modules overlap")
+        if (
+            protected_linear | protected_embedding | protected_normalization
+        ) != protected:
+            raise ValueError(
+                "RWKV-7 vLLM protected module categories are incomplete"
+            )
+        if (
+            protected_linear & protected_embedding
+            or protected_linear & protected_normalization
+            or protected_embedding & protected_normalization
+        ):
+            raise ValueError(
+                "RWKV-7 vLLM protected module categories must be disjoint"
+            )
+        if self.protected_state_tensors != self.protected_tensors:
+            raise ValueError("RWKV-7 vLLM protected state inventory drifted")
         if not quantized_low_rank <= low_rank or not quantized_low_rank <= quantized:
             raise ValueError(
                 "RWKV-7 vLLM quantized low-rank modules drifted from ownership"
@@ -216,6 +255,8 @@ class RWKV7VLLMLoaderMetadata(BaseModel):
             raise ValueError("RWKV-7 vLLM low-rank module inventory is incomplete")
         if not protected_v_first <= protected or protected_v_first & quantized:
             raise ValueError("RWKV-7 vLLM v_first Linear protection is incomplete")
+        if self.layer_zero_v_first_producer not in protected_linear:
+            raise ValueError("RWKV-7 vLLM layer-0 v_first producer is not protected")
         return self
 
 
@@ -224,7 +265,7 @@ class RWKV7ArtifactContract(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     repository: RWKV7RepositoryContract
     checkpoint: RWKV7CheckpointContract | None
     candidate: Literal[
@@ -262,6 +303,13 @@ class RWKV7QuantizationRecipeMetadata(BaseModel):
         "w8a16-low-rank-critical-high",
     ]
     candidate_order: list[str]
+    candidate_role: Literal[
+        "nvfp4-primary",
+        "nvfp4-weight-only-baseline",
+        "nvfp4-protection-ablation",
+        "low-rank-w8-diagnostic",
+    ]
+    runtime_requirement: Literal["blackwell-sm120", "portable-int8"]
     algorithm: Literal["NVFP4", "INT8"]
     weight_dtype: Literal["float4", "int8"]
     weight_group_size: Literal[16, 32]
@@ -285,6 +333,12 @@ class RWKV7QuantizationRecipeMetadata(BaseModel):
             raise ValueError(
                 "RWKV-7 quantization candidate set or order is unsupported"
             )
+        candidate_spec = _CANDIDATE_SPECS[self.candidate]
+        if (
+            self.candidate_role != candidate_spec["candidate_role"]
+            or self.runtime_requirement != candidate_spec["runtime_requirement"]
+        ):
+            raise ValueError("RWKV-7 candidate role or runtime requirement drifted")
         _validate_framework_versions(self.framework_versions)
         if not self.targets:
             raise ValueError(
@@ -372,6 +426,30 @@ def build_rwkv7_artifact_contract(
     protected_v_first_linear_modules = sorted(
         name for name in protected_modules if name.endswith(v_first_suffixes)
     )
+    protected_linear_suffixes = tuple(
+        f".{name}"
+        for name in (
+            *_TIME_MIX_LINEAR_NAMES,
+            *_LOW_RANK_LINEAR_NAMES,
+            *_V_FIRST_LINEAR_NAMES,
+        )
+    )
+    protected_linear_modules = [
+        name
+        for name in protected_modules
+        if name == _HEAD_IGNORE or name.endswith(protected_linear_suffixes)
+    ]
+    protected_embedding_modules = [
+        name
+        for name in protected_modules
+        if name == f"{target_policy.base_model_prefix}.embeddings"
+    ]
+    protected_normalization_modules = [
+        name
+        for name in protected_modules
+        if name not in set(protected_linear_modules)
+        | set(protected_embedding_modules)
+    ]
     if candidate == "w8a16-low-rank-critical-high" and set(
         quantized_low_rank_modules
     ) != set(low_rank_modules):
@@ -406,6 +484,11 @@ def build_rwkv7_artifact_contract(
             low_rank_linear_modules=low_rank_modules,
             quantized_low_rank_modules=quantized_low_rank_modules,
             protected_v_first_linear_modules=protected_v_first_linear_modules,
+            layer_zero_v_first_producer=layer_zero_value,
+            protected_linear_modules=protected_linear_modules,
+            protected_embedding_modules=protected_embedding_modules,
+            protected_normalization_modules=protected_normalization_modules,
+            protected_state_tensors=protected_tensors,
             protected_modules=protected_modules,
             protected_tensors=protected_tensors,
         ),
@@ -479,6 +562,8 @@ def _validate_candidate_scheme(
     return RWKV7QuantizationRecipeMetadata(
         candidate=candidate,
         candidate_order=list(_CANDIDATE_SCHEMES),
+        candidate_role=_CANDIDATE_SPECS[candidate]["candidate_role"],
+        runtime_requirement=_CANDIDATE_SPECS[candidate]["runtime_requirement"],
         algorithm="INT8" if is_w8 else "NVFP4",
         weight_dtype="int8" if is_w8 else "float4",
         weight_group_size=32 if is_w8 else 16,
@@ -721,7 +806,7 @@ assert isinstance(runtime_dtype, torch.dtype)
 assert warmup_runs >= 1
 assert timed_runs >= 1
 contract = getattr(config, 'rwkv7_quantization_metadata')
-assert contract['schema_version'] == 2
+assert contract['schema_version'] == 3
 assert contract['candidate'] in (
     'nvfp4-w4a4',
     'nvfp4-w4a16',
@@ -1533,12 +1618,41 @@ def apply_rwkv7_target_policy(
     other_time_mix_modules: list[str] = []
     later_v_first_tensors: list[str] = []
     low_rank_modules: list[str] = []
-    recurrent_time_mix_tensors: list[str] = []
+    recurrent_state_tensors: list[str] = []
+    embedding_modules: list[str] = []
+    normalization_modules: list[str] = []
     expected_linear_modules = {_HEAD_IGNORE}
 
     _require_module(model, "head", torch.nn.Linear, "head")
+    embeddings_path = f"{base_model_prefix}.embeddings"
+    _require_module(base_model, "embeddings", torch.nn.Embedding, embeddings_path)
+    embedding_modules.append(embeddings_path)
+    output_norm_path = f"{base_model_prefix}.ln_out"
+    _require_module(base_model, "ln_out", torch.nn.LayerNorm, output_norm_path)
+    normalization_modules.append(output_norm_path)
     for layer_id, block in enumerate(blocks):
         block_path = f"{base_model_prefix}.blocks.{layer_id}"
+
+        if layer_id == 0:
+            input_norm_type = (
+                torch.nn.Identity
+                if getattr(config, "embedding_layer_norm_fused", False)
+                else torch.nn.LayerNorm
+            )
+            _require_module(block, "ln0", input_norm_type, f"{block_path}.ln0")
+            if input_norm_type is torch.nn.LayerNorm:
+                normalization_modules.append(f"{block_path}.ln0")
+        else:
+            _require_module(
+                block,
+                "ln0",
+                torch.nn.Identity,
+                f"{block_path}.ln0",
+            )
+        for norm_name in ("ln1", "ln2"):
+            norm_path = f"{block_path}.{norm_name}"
+            _require_module(block, norm_name, torch.nn.LayerNorm, norm_path)
+            normalization_modules.append(norm_path)
 
         attention = _require_module(block, "att", torch.nn.Module, f"{block_path}.att")
         channel_mix = _require_module(
@@ -1549,6 +1663,14 @@ def apply_rwkv7_target_policy(
                 f"RWKV-7 target policy requires `{block_path}.att.layer_id == "
                 f"{layer_id}`."
             )
+        attention_norm_path = f"{block_path}.att.ln_x"
+        _require_module(
+            attention,
+            "ln_x",
+            torch.nn.GroupNorm,
+            attention_norm_path,
+        )
+        normalization_modules.append(attention_norm_path)
 
         for parameter_name in _TIME_MIX_PARAMETER_NAMES:
             parameter_path = f"{block_path}.att.{parameter_name}"
@@ -1557,7 +1679,7 @@ def apply_rwkv7_target_policy(
                 parameter_name,
                 parameter_path,
             )
-            recurrent_time_mix_tensors.append(parameter_path)
+            recurrent_state_tensors.append(parameter_path)
 
         for linear_name in _LOW_RANK_LINEAR_NAMES:
             module_path = f"{block_path}.att.{linear_name}"
@@ -1598,7 +1720,9 @@ def apply_rwkv7_target_policy(
             else:
                 other_time_mix_modules.append(module_path)
 
-        _require_parameter(channel_mix, "x_k", f"{block_path}.ffn.x_k")
+        channel_state_path = f"{block_path}.ffn.x_k"
+        _require_parameter(channel_mix, "x_k", channel_state_path)
+        recurrent_state_tensors.append(channel_state_path)
         for linear_name in ("key", "value"):
             module_path = f"{block_path}.ffn.{linear_name}"
             _require_module(channel_mix, linear_name, torch.nn.Linear, module_path)
@@ -1699,15 +1823,35 @@ def apply_rwkv7_target_policy(
         [
             QuantizationTargetPolicyDecision(
                 kind="module",
+                names=embedding_modules,
+                reason=(
+                    "Keep token embeddings high precision outside every Linear "
+                    "quantization candidate."
+                ),
+            ),
+            QuantizationTargetPolicyDecision(
+                kind="module",
+                names=normalization_modules,
+                reason=(
+                    "Keep every LayerNorm and GroupNorm high precision outside "
+                    "every Linear quantization candidate."
+                ),
+            ),
+        ]
+    )
+    protections.extend(
+        [
+            QuantizationTargetPolicyDecision(
+                kind="module",
                 names=[_HEAD_IGNORE],
                 reason="Keep the output head high precision in every candidate.",
             ),
             QuantizationTargetPolicyDecision(
                 kind="tensor",
-                names=recurrent_time_mix_tensors,
+                names=recurrent_state_tensors,
                 reason=(
-                    "Keep all recurrent TimeMix raw Parameters high precision; "
-                    "v0 remains on the protected v_first path."
+                    "Keep all recurrent TimeMix and ChannelMix state Parameters "
+                    "high precision; v0 remains on the protected v_first path."
                 ),
             ),
         ]
