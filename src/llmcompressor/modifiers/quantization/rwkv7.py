@@ -493,10 +493,10 @@ def _installed_transformers_provenance() -> RWKV7TransformersProvenance:
     )
 
 
-def validate_rwkv7_transformers_provenance(
+def _validate_rwkv7_transformers_source_provenance(
     contract: RWKV7RepositoryContract | None = None,
 ) -> RWKV7TransformersProvenance:
-    """Fail closed unless the installed Transformers matches the RWKV-7 fork."""
+    """Fail closed unless Transformers comes from the exact self-owned revision."""
 
     expected = RWKV7RepositoryContract() if contract is None else contract
     observed = _installed_transformers_provenance()
@@ -509,6 +509,15 @@ def validate_rwkv7_transformers_provenance(
             f"expected={expected.transformers_repository}@{expected.transformers_oid} "
             f"actual={observed.repository}@{observed.revision}"
         )
+    return observed
+
+
+def validate_rwkv7_transformers_provenance(
+    contract: RWKV7RepositoryContract | None = None,
+) -> RWKV7TransformersProvenance:
+    """Validate the self-owned Transformers source and delegated operator runtime."""
+
+    observed = _validate_rwkv7_transformers_source_provenance(contract)
     from transformers.models.rwkv7 import validate_rwkv7_runtime_provenance
 
     if not callable(validate_rwkv7_runtime_provenance):
@@ -1080,7 +1089,7 @@ def build_rwkv7_artifact_contract(
             raise ValueError(
                 "formal RWKV-7 artifacts require operator-runtime provenance"
             )
-        runtime_provenance = _installed_transformers_provenance()
+        runtime_provenance = _validate_rwkv7_transformers_source_provenance()
         if serialization_only_provenance != runtime_provenance:
             raise RuntimeError(
                 "RWKV-7 serialization provenance differs from the active checkout"
@@ -1650,6 +1659,7 @@ def _snapshot_rwkv7_protected_parameters(
         owner = model.get_submodule(name.rsplit(".", 1)[0])
         snapshot[name] = {
             "owner_id": id(owner),
+            "parameter_id": id(parameter),
             "shape": list(parameter.shape),
             "dtype": str(parameter.dtype),
             "sha256": _tensor_sha256(parameter),
@@ -1679,6 +1689,10 @@ def _verify_rwkv7_protected_parameters(
             raise RuntimeError(
                 f"RWKV-7 quantization replaced a protected module: {name}"
             )
+        if id(parameter) != expected.get("parameter_id"):
+            raise RuntimeError(
+                f"RWKV-7 quantization replaced a protected Parameter: {name}"
+            )
         if list(parameter.shape) != expected.get("shape"):
             raise RuntimeError(
                 f"RWKV-7 quantization changed a protected tensor shape: {name}"
@@ -1697,6 +1711,7 @@ def _verify_rwkv7_protected_parameters(
         "passed": True,
         "parameter_count": len(sha256),
         "module_identity_preserved": True,
+        "parameter_identity_preserved": True,
         "parameter_ownership_preserved": True,
         "parameter_values_preserved": True,
         "parameter_sha256": sha256,
@@ -1792,7 +1807,7 @@ def audit_rwkv7_quantized_checkpoint(
     transformers_provenance = (
         validate_rwkv7_transformers_provenance(loaded_contract.repository)
         if require_operator_runtime_provenance
-        else _installed_transformers_provenance()
+        else _validate_rwkv7_transformers_source_provenance(loaded_contract.repository)
     )
     if transformers_provenance != loaded_contract.runtime_provenance:
         raise RuntimeError(
@@ -2041,6 +2056,7 @@ from llmcompressor.modifiers.quantization.rwkv7 import (
     _validate_native_rwkv7_config,
     _validate_native_rwkv7_runtime,
     _validate_rwkv7_loading_info,
+    _validate_rwkv7_transformers_source_provenance,
     validate_rwkv7_transformers_provenance,
 )
 
@@ -2054,12 +2070,6 @@ _validate_native_rwkv7_config(serialized_config)
 serialized_contract = serialized_config['rwkv7_quantization_metadata']
 contract_model = RWKV7ArtifactContract.model_validate(serialized_contract)
 contract = contract_model.model_dump(mode='json')
-
-from transformers import Rwkv7Config
-from transformers.models.rwkv7 import Rwkv7ForCausalLM
-from transformers.utils.quantization_config import CompressedTensorsConfig
-
-config = Rwkv7Config.from_pretrained(sys.argv[1], trust_remote_code=False)
 generate_seed = int(sys.argv[2])
 prompt_ids = json.loads(sys.argv[3])
 max_new_tokens = int(sys.argv[4])
@@ -2081,6 +2091,28 @@ require(
     ),
     'runtime device must be cpu or cuda',
 )
+repository_contract = RWKV7RepositoryContract.model_validate(
+    contract_model.repository
+)
+if execution_mode == 'load-only':
+    active_provenance = _validate_rwkv7_transformers_source_provenance(
+        repository_contract
+    )
+else:
+    active_provenance = validate_rwkv7_transformers_provenance(
+        repository_contract
+    )
+if active_provenance != contract_model.runtime_provenance:
+    raise RuntimeError(
+        'RWKV-7 serialized provenance differs from the active runtime scope'
+    )
+transformers_provenance = active_provenance.model_dump(mode='json')
+
+from transformers import Rwkv7Config
+from transformers.models.rwkv7 import Rwkv7ForCausalLM
+from transformers.utils.quantization_config import CompressedTensorsConfig
+
+config = Rwkv7Config.from_pretrained(sys.argv[1], trust_remote_code=False)
 runtime_dtype = config.dtype
 require(isinstance(runtime_dtype, torch.dtype), 'config dtype is not torch.dtype')
 require(warmup_runs >= 1, 'warmup_runs must be at least one')
@@ -2195,7 +2227,7 @@ if execution_mode == 'load-only':
             contract['vllm']['protected_parameter_keys']
         ),
         'artifact_contract_validated': True,
-        'transformers_provenance': None,
+        'transformers_provenance': transformers_provenance,
         'execution_mode': execution_mode,
         'standard_linear_load': load_evidence,
         'runtime_measurement': {
@@ -2208,14 +2240,6 @@ if execution_mode == 'load-only':
     }))
     raise SystemExit(0)
 
-transformers_provenance = validate_rwkv7_transformers_provenance(
-    RWKV7RepositoryContract.model_validate(contract_model.repository)
-)
-if transformers_provenance != contract_model.runtime_provenance:
-    raise RuntimeError(
-        'RWKV-7 serialized runtime provenance differs from the active runtime'
-    )
-transformers_provenance = transformers_provenance.model_dump(mode='json')
 prompt = torch.tensor([prompt_ids], device=runtime_device)
 
 def generate_once():
@@ -2379,7 +2403,7 @@ def quantize_rwkv7_oneshot(
     _validate_framework_versions(framework_versions)
     serialization_only = fresh_reload_mode == "load-only"
     runtime_provenance = (
-        _installed_transformers_provenance()
+        _validate_rwkv7_transformers_source_provenance()
         if serialization_only
         else validate_rwkv7_transformers_provenance()
     )
@@ -2573,11 +2597,15 @@ def quantize_rwkv7_oneshot(
             "failures": failures,
         }
         _atomic_json(destination / "rwkv7_quantization_execution.json", metadata)
-        if checkpoint_contract is not None and reload_run.returncode != 0:
+        if reload_run.returncode != 0:
             failures.append(
                 {
                     "candidate": candidate,
-                    "stage": "fresh_reload_generate",
+                    "stage": (
+                        "fresh_reload_load"
+                        if fresh_reload_mode == "load-only"
+                        else "fresh_reload_generate"
+                    ),
                     "error_type": "SubprocessError",
                     "error": reload_run.stderr[-8000:],
                 }

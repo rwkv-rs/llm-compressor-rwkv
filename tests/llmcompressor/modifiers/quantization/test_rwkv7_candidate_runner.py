@@ -24,6 +24,7 @@ from llmcompressor.modifiers.quantization.rwkv7 import (
     _validate_native_rwkv7_config,
     _validate_native_rwkv7_runtime,
     _validate_rwkv7_loading_info,
+    _validate_rwkv7_transformers_source_provenance,
     _verify_rwkv7_protected_parameters,
     audit_rwkv7_quantized_checkpoint,
     build_rwkv7_artifact_contract,
@@ -235,6 +236,41 @@ def test_rwkv7_transformers_provenance_delegates_operator_gate(monkeypatch):
     assert provenance.operator_runtime == dict(
         sorted(_operator_runtime_provenance().items())
     )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("repository", "revision"),
+    [
+        (
+            "https://github.com/huggingface/transformers.git",
+            "2696927df9363b5fa175076bb827ba4da2c4e581",
+        ),
+        (
+            "https://github.com/rwkv-rs/transformers-rwkv.git",
+            "0" * 40,
+        ),
+    ],
+    ids=["upstream-repository", "wrong-revision"],
+)
+def test_rwkv7_transformers_source_provenance_rejects_wrong_source(
+    monkeypatch,
+    repository,
+    revision,
+):
+    monkeypatch.setattr(
+        rwkv7_module,
+        "_installed_transformers_provenance",
+        lambda: _transformers_provenance().model_copy(
+            update={"repository": repository, "revision": revision}
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="repository URL|Transformers provenance mismatch",
+    ):
+        _validate_rwkv7_transformers_source_provenance()
 
 
 @pytest.mark.unit
@@ -752,6 +788,27 @@ def test_protected_snapshot_rejects_parameter_value_rewrite(monkeypatch):
         _verify_rwkv7_protected_parameters(model, contract, snapshot)
 
 
+@pytest.mark.unit
+def test_protected_snapshot_rejects_equal_parameter_replacement(monkeypatch):
+    monkeypatch.setattr(
+        rwkv7_module,
+        "validate_rwkv7_transformers_provenance",
+        _runtime_provenance,
+    )
+    model = _tiny_standard_rwkv7().eval()
+    modifier = build_rwkv7_quantization_recipe(model, "nvfp4-w4a16")
+    contract = build_rwkv7_artifact_contract(
+        modifier.target_policy_metadata,
+        "nvfp4-w4a16",
+    )
+    snapshot = _snapshot_rwkv7_protected_parameters(model, contract)
+    layer_norm = model.model.blocks[0].ln1
+    layer_norm.bias = torch.nn.Parameter(layer_norm.bias.detach().clone())
+
+    with pytest.raises(RuntimeError, match="replaced a protected Parameter"):
+        _verify_rwkv7_protected_parameters(model, contract, snapshot)
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize(
     "candidate",
@@ -844,6 +901,12 @@ def test_w4a16_real_serializer_preserves_mainstream_config_contract(
     assert audit["protected_parameter_values_verified"] is True
 
     if candidate == "nvfp4-w4a16":
+        try:
+            observed_transformers = (
+                _validate_rwkv7_transformers_source_provenance().model_dump(mode="json")
+            )
+        except RuntimeError as error:
+            pytest.skip(f"requires the product-pinned Transformers revision: {error}")
         fresh_process = subprocess.run(
             [
                 sys.executable,
@@ -866,7 +929,7 @@ def test_w4a16_real_serializer_preserves_mainstream_config_contract(
         load_evidence = json.loads(fresh_process.stdout.strip().splitlines()[-1])
         assert load_evidence["execution_mode"] == "load-only"
         assert load_evidence["artifact_contract_validated"] is True
-        assert load_evidence["transformers_provenance"] is None
+        assert load_evidence["transformers_provenance"] == observed_transformers
         assert load_evidence["standard_generate"] == {
             "passed": False,
             "executed": False,

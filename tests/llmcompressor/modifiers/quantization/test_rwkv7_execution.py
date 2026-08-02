@@ -15,7 +15,7 @@ from llmcompressor.modifiers.quantization.rwkv7 import (
     RWKV7CheckpointContract,
     RWKV7TransformersProvenance,
     _fresh_reload_generate_script,
-    _installed_transformers_provenance,
+    _validate_rwkv7_transformers_source_provenance,
     quantize_rwkv7_oneshot,
 )
 
@@ -62,7 +62,10 @@ def _synthetic_runtime_provenance(*_args):
 
 @pytest.mark.unit
 def test_fresh_reload_program_is_valid_python():
-    compile(_fresh_reload_generate_script(), "<rwkv7-fresh-reload>", "exec")
+    script = _fresh_reload_generate_script()
+    compile(script, "<rwkv7-fresh-reload>", "exec")
+    assert "_validate_rwkv7_transformers_source_provenance(" in script
+    assert "'transformers_provenance': None" not in script
 
 
 @pytest.mark.unit
@@ -131,9 +134,9 @@ def test_execution_falls_back_only_in_closed_order(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "subprocess.run",
         lambda *args, **kwargs: SimpleNamespace(
-            returncode=1,
-            stdout="",
-            stderr="reload blocked",
+            returncode=0,
+            stdout="{}\n",
+            stderr="",
         ),
     )
     _, metadata = quantize_rwkv7_oneshot(
@@ -188,11 +191,63 @@ def test_formal_execution_rejects_a_failed_fresh_process_reload(tmp_path, monkey
     assert evidence["failures"][-1]["stage"] == "fresh_reload_generate"
 
 
+@pytest.mark.unit
+def test_source_only_execution_rejects_a_failed_fresh_process_load(
+    tmp_path,
+    monkeypatch,
+):
+    source_provenance = _synthetic_runtime_provenance().model_copy(
+        update={"operator_runtime": {}}
+    )
+    monkeypatch.setattr("llmcompressor.oneshot", lambda *, model, **kwargs: model)
+    monkeypatch.setattr(
+        "llmcompressor.modifiers.quantization.rwkv7.audit_rwkv7_quantized_checkpoint",
+        lambda *args, **kwargs: {"format": "nvfp4-pack-quantized"},
+    )
+    monkeypatch.setattr(
+        "llmcompressor.modifiers.quantization.rwkv7."
+        "_validate_rwkv7_transformers_source_provenance",
+        lambda *_args: source_provenance,
+    )
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="fresh process could not load",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="fresh_reload_load"):
+        quantize_rwkv7_oneshot(
+            lambda: _model("cpu"),
+            tmp_path,
+            calibration_dataset=None,
+            processor=None,
+            forced_candidate="nvfp4-w4a16",
+            fresh_reload_mode="load-only",
+            fresh_reload_device="cpu",
+        )
+
+    evidence = json.loads(
+        (tmp_path / "nvfp4-w4a16" / "rwkv7_quantization_execution.json").read_text()
+    )
+    assert evidence["fresh_reload"]["passed"] is False
+    assert evidence["failures"][-1]["stage"] == "fresh_reload_load"
+
+
 @pytest.mark.integration
 def test_nvfp4_w4a16_oneshot_save_and_fresh_direct_class_load(
     tmp_path,
     owned_process_tmpdir,
 ):
+    try:
+        observed_transformers = (
+            _validate_rwkv7_transformers_source_provenance().model_dump(mode="json")
+        )
+    except RuntimeError as error:
+        pytest.skip(f"requires the product-pinned Transformers revision: {error}")
+
     model, metadata = quantize_rwkv7_oneshot(
         lambda: _model("cpu"),
         tmp_path,
@@ -208,7 +263,6 @@ def test_nvfp4_w4a16_oneshot_save_and_fresh_direct_class_load(
     assert metadata["candidate"] == "nvfp4-w4a16"
     assert metadata["quantization_applied"] is True
     assert metadata["provenance_scope"] == "serialization-only"
-    observed_transformers = _installed_transformers_provenance().model_dump(mode="json")
     assert metadata["artifact_contract"]["runtime_provenance"] == (
         observed_transformers
     )
@@ -220,6 +274,7 @@ def test_nvfp4_w4a16_oneshot_save_and_fresh_direct_class_load(
     protection_audit = metadata["protection_audit"]
     assert protection_audit["passed"] is True
     assert protection_audit["module_identity_preserved"] is True
+    assert protection_audit["parameter_identity_preserved"] is True
     assert protection_audit["parameter_ownership_preserved"] is True
     assert protection_audit["parameter_values_preserved"] is True
     assert protection_audit["parameter_count"] == len(
@@ -234,6 +289,7 @@ def test_nvfp4_w4a16_oneshot_save_and_fresh_direct_class_load(
         "passed": False,
         "executed": False,
     }
+    assert fresh_evidence["transformers_provenance"] == observed_transformers
     strict_load = fresh_evidence["standard_linear_load"]
     assert strict_load["loader"] == "Rwkv7ForCausalLM.from_pretrained"
     assert strict_load["strict_loading_info"] is True
