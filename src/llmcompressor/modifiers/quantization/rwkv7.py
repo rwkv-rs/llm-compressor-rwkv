@@ -112,7 +112,7 @@ _LLM_COMPRESSOR_UPSTREAM_REPOSITORY = (
 _LLM_COMPRESSOR_UPSTREAM_OID = "28c9c76b74cdd47076f95d012227482d22a8f365"
 _LLM_COMPRESSOR_FORK_REPOSITORY = "https://github.com/rwkv-rs/llm-compressor-rwkv.git"
 _TRANSFORMERS_RWKV_REPOSITORY = "https://github.com/rwkv-rs/transformers-rwkv.git"
-_TRANSFORMERS_RWKV_OID = "5d11fbe2559fec5611798bd6cc3f6c89ae145f68"
+_TRANSFORMERS_RWKV_OID = "3f4c053021cc34fcced398c51d3836ca96343fa7"
 _RWKV7_CANONICAL_REPOSITORIES = frozenset(
     {
         "vllm-project/llm-compressor",
@@ -229,7 +229,7 @@ class RWKV7RepositoryContract(BaseModel):
     transformers_repository: Literal[
         "https://github.com/rwkv-rs/transformers-rwkv.git"
     ] = _TRANSFORMERS_RWKV_REPOSITORY
-    transformers_oid: Literal["5d11fbe2559fec5611798bd6cc3f6c89ae145f68"] = (
+    transformers_oid: Literal["3f4c053021cc34fcced398c51d3836ca96343fa7"] = (
         _TRANSFORMERS_RWKV_OID
     )
 

@@ -62,7 +62,7 @@ def _operator_runtime_provenance():
 def _transformers_provenance():
     return RWKV7TransformersProvenance(
         repository="https://github.com/rwkv-rs/transformers-rwkv.git",
-        revision="5d11fbe2559fec5611798bd6cc3f6c89ae145f68",
+        revision="3f4c053021cc34fcced398c51d3836ca96343fa7",
         installation_source="editable-git",
         editable=True,
     )
@@ -232,7 +232,7 @@ def test_rwkv7_transformers_provenance_delegates_operator_gate(monkeypatch):
 
     assert calls == ["called"]
     assert provenance.repository == ("https://github.com/rwkv-rs/transformers-rwkv.git")
-    assert provenance.revision == ("5d11fbe2559fec5611798bd6cc3f6c89ae145f68")
+    assert provenance.revision == ("3f4c053021cc34fcced398c51d3836ca96343fa7")
     assert provenance.installation_source == "editable-git"
     assert provenance.editable is True
     assert provenance.operator_runtime == dict(
@@ -246,7 +246,7 @@ def test_rwkv7_transformers_provenance_delegates_operator_gate(monkeypatch):
     [
         (
             "https://github.com/huggingface/transformers.git",
-            "5d11fbe2559fec5611798bd6cc3f6c89ae145f68",
+            "3f4c053021cc34fcced398c51d3836ca96343fa7",
         ),
         (
             "https://github.com/rwkv-rs/transformers-rwkv.git",
@@ -355,9 +355,9 @@ def test_rwkv7_transformers_pep610_rejects_hostile_repository(
                     "vcs_info": {
                         "vcs": "git",
                         "requested_revision": (
-                            "5d11fbe2559fec5611798bd6cc3f6c89ae145f68"
+                            "3f4c053021cc34fcced398c51d3836ca96343fa7"
                         ),
-                        "commit_id": "5d11fbe2559fec5611798bd6cc3f6c89ae145f68",
+                        "commit_id": "3f4c053021cc34fcced398c51d3836ca96343fa7",
                     },
                 }
             )
@@ -914,7 +914,7 @@ def test_rwkv7_transformers_provenance_rejects_unpinned_vcs_request(monkeypatch)
                     "vcs_info": {
                         "vcs": "git",
                         "requested_revision": "main",
-                        "commit_id": ("5d11fbe2559fec5611798bd6cc3f6c89ae145f68"),
+                        "commit_id": ("3f4c053021cc34fcced398c51d3836ca96343fa7"),
                     },
                 }
             )
@@ -974,7 +974,7 @@ def test_artifact_contract_pins_fork_standard_names_and_v_first_protection(
         "https://github.com/rwkv-rs/llm-compressor-rwkv.git"
     )
     assert contract.repository.transformers_oid == (
-        "5d11fbe2559fec5611798bd6cc3f6c89ae145f68"
+        "3f4c053021cc34fcced398c51d3836ca96343fa7"
     )
     assert contract.runtime_provenance == _runtime_provenance()
     assert (

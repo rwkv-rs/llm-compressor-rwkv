@@ -120,7 +120,7 @@ def _standard_rwkv7_types(monkeypatch, request):
         "validate_rwkv7_transformers_provenance",
         lambda *_args: RWKV7TransformersProvenance(
             repository="https://github.com/rwkv-rs/transformers-rwkv.git",
-            revision="5d11fbe2559fec5611798bd6cc3f6c89ae145f68",
+            revision="3f4c053021cc34fcced398c51d3836ca96343fa7",
             installation_source="editable-git",
             editable=True,
         ),
