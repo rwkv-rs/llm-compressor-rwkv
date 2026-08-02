@@ -10,13 +10,14 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Mapping
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Callable, Literal
 from urllib.parse import unquote, urlparse
 
 import torch
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 __all__ = [
     "QuantizationTargetPolicyDecision",
@@ -137,7 +138,7 @@ class RWKV7RepositoryContract(BaseModel):
 
 
 class RWKV7TransformersProvenance(BaseModel):
-    """Observed installation provenance for the RWKV-7 Transformers fork."""
+    """Observed Transformers and delegated operator-runtime provenance."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -145,12 +146,52 @@ class RWKV7TransformersProvenance(BaseModel):
     revision: str
     installation_source: Literal["pep610-vcs", "editable-git"]
     editable: bool
+    operator_runtime: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_revision(self) -> RWKV7TransformersProvenance:
         if re.fullmatch(r"[0-9a-f]{40}", self.revision) is None:
             raise ValueError("RWKV-7 Transformers provenance requires a full Git OID")
         return self
+
+
+def _normalize_operator_runtime_provenance(
+    provenance: object,
+) -> dict[str, str]:
+    if not isinstance(provenance, Mapping):
+        raise RuntimeError(
+            "RWKV-7 Transformers public runtime provenance gate returned "
+            "non-mapping evidence"
+        )
+    normalized = {}
+    for key, value in provenance.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise RuntimeError(
+                "RWKV-7 Transformers public runtime provenance evidence must "
+                "contain only string keys and values"
+            )
+        normalized[key] = value
+    required = {
+        "distribution",
+        "distribution_version",
+        "extra",
+        "flash_rwkv_distribution",
+        "flash_rwkv_distribution_version",
+        "flash_rwkv_repository",
+        "flash_rwkv_revision",
+        "flash_rwkv_source_kind",
+        "repository",
+        "requirement",
+        "revision",
+        "source_kind",
+    }
+    missing = sorted(required - normalized.keys())
+    if missing:
+        raise RuntimeError(
+            "RWKV-7 Transformers public runtime provenance evidence is incomplete: "
+            f"missing={missing}"
+        )
+    return dict(sorted(normalized.items()))
 
 
 def _canonical_repository_url(repository: str) -> str:
@@ -254,9 +295,18 @@ def _installed_transformers_provenance() -> RWKV7TransformersProvenance:
     import transformers
 
     module_path = Path(transformers.__file__).resolve()
-    if not module_path.is_relative_to(repository_root):
+    repository_top_level = Path(
+        _git_provenance_value(repository_root, "rev-parse", "--show-toplevel")
+    ).resolve()
+    if repository_top_level != repository_root:
         raise RuntimeError(
-            f"{requirement}; imported module is outside its editable source"
+            f"{requirement}; editable source is not the Git repository root"
+        )
+    expected_module_path = repository_root / "src/transformers/__init__.py"
+    if module_path != expected_module_path.resolve():
+        raise RuntimeError(
+            f"{requirement}; imported module does not belong to the editable "
+            "Transformers source package"
         )
     revision = _git_provenance_value(repository_root, "rev-parse", "HEAD")
     repository = _git_provenance_value(
@@ -304,7 +354,10 @@ def validate_rwkv7_transformers_provenance(
         raise RuntimeError(
             "RWKV-7 Transformers fork lacks its public runtime provenance gate"
         )
-    return observed
+    operator_runtime = _normalize_operator_runtime_provenance(
+        validate_rwkv7_runtime_provenance()
+    )
+    return observed.model_copy(update={"operator_runtime": operator_runtime})
 
 
 class RWKV7CheckpointContract(BaseModel):
@@ -442,6 +495,7 @@ class RWKV7ArtifactContract(BaseModel):
 
     schema_version: Literal[3] = 3
     repository: RWKV7RepositoryContract
+    runtime_provenance: RWKV7TransformersProvenance
     checkpoint: RWKV7CheckpointContract | None
     candidate: Literal[
         "nvfp4-w4a4",
@@ -461,6 +515,51 @@ class RWKV7ArtifactContract(BaseModel):
             raise ValueError(
                 "RWKV-7 compressed artifact metadata must record applied "
                 "quantization"
+            )
+        if self.candidate != recipe.candidate:
+            raise ValueError(
+                "RWKV-7 artifact candidate must match recipe metadata"
+            )
+        if self.runtime_provenance != recipe.runtime_provenance:
+            raise ValueError(
+                "RWKV-7 artifact runtime provenance must match recipe metadata"
+            )
+        expected_format = (
+            "pack-quantized"
+            if self.candidate == "w8a16-low-rank-critical-high"
+            else "nvfp4-pack-quantized"
+        )
+        if self.vllm.quantization_format != expected_format:
+            raise ValueError(
+                "RWKV-7 artifact candidate and quantization format are inconsistent"
+            )
+        if self.vllm.quantized_modules != self.target_policy.selection.names:
+            raise ValueError(
+                "RWKV-7 artifact quantized inventory must match target policy"
+            )
+        protected_modules = [
+            name
+            for decision in self.target_policy.protections
+            if decision.kind == "module"
+            for name in decision.names
+        ]
+        protected_tensors = [
+            name
+            for decision in self.target_policy.protections
+            if decision.kind == "tensor"
+            for name in decision.names
+        ]
+        if self.vllm.protected_modules != protected_modules:
+            raise ValueError(
+                "RWKV-7 artifact protected module inventory must match target policy"
+            )
+        if self.vllm.protected_tensors != protected_tensors:
+            raise ValueError(
+                "RWKV-7 artifact protected tensor inventory must match target policy"
+            )
+        if self.formal_checkpoint != (self.checkpoint is not None):
+            raise ValueError(
+                "RWKV-7 formal checkpoint flag must match checkpoint provenance"
             )
         return self
 
@@ -500,6 +599,7 @@ class RWKV7QuantizationRecipeMetadata(BaseModel):
     low_rank_weight_dtype: Literal["none", "int8"]
     targets: list[str]
     framework_versions: dict[str, str]
+    runtime_provenance: RWKV7TransformersProvenance
     quantization_applied: bool = False
 
     @model_validator(mode="after")
@@ -562,12 +662,16 @@ def build_rwkv7_artifact_contract(
 ) -> RWKV7ArtifactContract:
     """Resolve the exact standard-HF names protected at the runtime boundary."""
 
-    validate_rwkv7_transformers_provenance()
+    runtime_provenance = validate_rwkv7_transformers_provenance()
     if candidate not in _CANDIDATE_SCHEMES:
         raise ValueError(f"unsupported RWKV-7 candidate for artifact: {candidate}")
     if target_policy.recipe is None or target_policy.recipe.candidate != candidate:
         raise ValueError(
             "RWKV-7 artifact candidate must match resolved recipe metadata"
+        )
+    if target_policy.recipe.runtime_provenance != runtime_provenance:
+        raise RuntimeError(
+            "RWKV-7 recipe runtime provenance drifted before artifact export"
         )
     artifact_target_policy = target_policy.model_copy(
         update={
@@ -644,6 +748,7 @@ def build_rwkv7_artifact_contract(
         raise ValueError("RWKV-7 artifact contains non-standard module names")
     return RWKV7ArtifactContract(
         repository=RWKV7RepositoryContract(),
+        runtime_provenance=runtime_provenance,
         checkpoint=checkpoint,
         candidate=candidate,
         target_policy=artifact_target_policy,
@@ -696,6 +801,7 @@ def _validate_candidate_scheme(
     *,
     targets: list[str],
     framework_versions: dict[str, str],
+    runtime_provenance: RWKV7TransformersProvenance,
 ) -> RWKV7QuantizationRecipeMetadata:
     weights = scheme.weights
     inputs = scheme.input_activations
@@ -751,6 +857,7 @@ def _validate_candidate_scheme(
         low_rank_weight_dtype="int8" if is_w8 else "none",
         targets=targets,
         framework_versions=framework_versions,
+        runtime_provenance=runtime_provenance,
     )
 
 
@@ -773,7 +880,7 @@ def build_rwkv7_quantization_recipe(
         else dict(framework_versions)
     )
     _validate_framework_versions(versions)
-    validate_rwkv7_transformers_provenance()
+    runtime_provenance = validate_rwkv7_transformers_provenance()
 
     from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
 
@@ -808,6 +915,7 @@ def build_rwkv7_quantization_recipe(
         next(iter(modifier.resolved_config.config_groups.values())),
         targets=list(modifier.target_policy_metadata.selection.names),
         framework_versions=versions,
+        runtime_provenance=runtime_provenance,
     )
     if (
         modifier.target_policy_metadata.protection_profile

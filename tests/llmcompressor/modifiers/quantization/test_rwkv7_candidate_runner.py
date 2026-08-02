@@ -8,6 +8,7 @@ import sys
 import pytest
 import torch
 
+import llmcompressor.modifiers.quantization.rwkv7 as rwkv7_module
 from llmcompressor.core import Event, EventType, State
 from llmcompressor.modifiers.quantization.rwkv7 import (
     RWKV7ArtifactContract,
@@ -21,6 +22,42 @@ from llmcompressor.modifiers.quantization.rwkv7 import (
     validate_rwkv7_transformers_provenance,
     verify_rwkv7_checkpoint,
 )
+
+
+def _operator_runtime_provenance():
+    return {
+        "distribution": "flash-linear-attention",
+        "distribution_version": "0.5.2",
+        "extra": "flash-rwkv",
+        "flash_rwkv_distribution": "flash-rwkv",
+        "flash_rwkv_distribution_version": "0.1.0",
+        "flash_rwkv_repository": "https://github.com/rwkv-rs/FlashRWKV.git",
+        "flash_rwkv_revision": "866aafd2eed146b0eda1ce03444009ae030f89e3",
+        "flash_rwkv_source_kind": "vcs",
+        "repository": "https://github.com/rwkv-rs/fla-rwkv.git",
+        "requirement": (
+            "flash-linear-attention[flash-rwkv] @ "
+            "git+https://github.com/rwkv-rs/fla-rwkv.git@"
+            "a4a8aa98df6ec5322f194a80ec57363dd045adfc"
+        ),
+        "revision": "a4a8aa98df6ec5322f194a80ec57363dd045adfc",
+        "source_kind": "vcs",
+    }
+
+
+def _transformers_provenance():
+    return RWKV7TransformersProvenance(
+        repository="https://github.com/rwkv-rs/transformers-rwkv.git",
+        revision="2696927df9363b5fa175076bb827ba4da2c4e581",
+        installation_source="editable-git",
+        editable=True,
+    )
+
+
+def _runtime_provenance():
+    return _transformers_provenance().model_copy(
+        update={"operator_runtime": _operator_runtime_provenance()}
+    )
 
 
 def _tiny_standard_rwkv7():
@@ -145,9 +182,21 @@ print(json.dumps({{
 
 
 @pytest.mark.unit
-def test_rwkv7_transformers_provenance_matches_exact_editable_fork():
+def test_rwkv7_transformers_provenance_delegates_operator_gate(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        rwkv7_module,
+        "_installed_transformers_provenance",
+        _transformers_provenance,
+    )
+    monkeypatch.setattr(
+        "transformers.models.rwkv7.validate_rwkv7_runtime_provenance",
+        lambda: calls.append("called") or _operator_runtime_provenance(),
+    )
+
     provenance = validate_rwkv7_transformers_provenance()
 
+    assert calls == ["called"]
     assert provenance.repository == (
         "https://github.com/rwkv-rs/transformers-rwkv.git"
     )
@@ -156,6 +205,70 @@ def test_rwkv7_transformers_provenance_matches_exact_editable_fork():
     )
     assert provenance.installation_source == "editable-git"
     assert provenance.editable is True
+    assert provenance.operator_runtime == dict(
+        sorted(_operator_runtime_provenance().items())
+    )
+
+
+@pytest.mark.unit
+def test_rwkv7_transformers_provenance_propagates_operator_failure(monkeypatch):
+    monkeypatch.setattr(
+        rwkv7_module,
+        "_installed_transformers_provenance",
+        _transformers_provenance,
+    )
+
+    def fail_operator_provenance():
+        raise RuntimeError("operator provenance unavailable")
+
+    monkeypatch.setattr(
+        "transformers.models.rwkv7.validate_rwkv7_runtime_provenance",
+        fail_operator_provenance,
+    )
+
+    with pytest.raises(RuntimeError, match="operator provenance unavailable"):
+        validate_rwkv7_transformers_provenance()
+
+
+@pytest.mark.unit
+def test_rwkv7_editable_provenance_rejects_repo_local_shadow_module(
+    tmp_path, monkeypatch
+):
+    import transformers
+
+    repository_root = tmp_path / "transformers-rwkv"
+    shadow_module = (
+        repository_root
+        / ".venv/lib/python3.12/site-packages/transformers/__init__.py"
+    )
+    shadow_module.parent.mkdir(parents=True)
+    shadow_module.write_text("", encoding="utf-8")
+
+    class _EditableDistribution:
+        @staticmethod
+        def read_text(filename):
+            assert filename == "direct_url.json"
+            return json.dumps(
+                {
+                    "url": repository_root.as_uri(),
+                    "dir_info": {"editable": True},
+                }
+            )
+
+    monkeypatch.setattr(
+        rwkv7_module.importlib_metadata,
+        "distribution",
+        lambda name: _EditableDistribution(),
+    )
+    monkeypatch.setattr(transformers, "__file__", str(shadow_module))
+    monkeypatch.setattr(
+        rwkv7_module,
+        "_git_provenance_value",
+        lambda source, *arguments: str(repository_root),
+    )
+
+    with pytest.raises(RuntimeError, match="does not belong to the editable"):
+        rwkv7_module._installed_transformers_provenance()
 
 
 @pytest.mark.unit
@@ -230,7 +343,14 @@ def test_rwkv7_transformers_provenance_rejects_revision_drift(monkeypatch):
 
 
 @pytest.mark.unit
-def test_artifact_contract_pins_fork_standard_names_and_v_first_protection():
+def test_artifact_contract_pins_fork_standard_names_and_v_first_protection(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        rwkv7_module,
+        "validate_rwkv7_transformers_provenance",
+        _runtime_provenance,
+    )
     modifier = build_rwkv7_quantization_recipe(_tiny_standard_rwkv7())
     assert modifier.target_policy_metadata.recipe.quantization_applied is False
 
@@ -248,6 +368,11 @@ def test_artifact_contract_pins_fork_standard_names_and_v_first_protection():
     )
     assert contract.repository.transformers_oid == (
         "2696927df9363b5fa175076bb827ba4da2c4e581"
+    )
+    assert contract.runtime_provenance == _runtime_provenance()
+    assert (
+        contract.target_policy.recipe.runtime_provenance
+        == contract.runtime_provenance
     )
     assert contract.checkpoint.sha256 == (
         "737079d81865801fd85e5459488d89a36d5304a524e890244eb83d44f531c89c"
@@ -282,11 +407,16 @@ def test_artifact_contract_pins_fork_standard_names_and_v_first_protection():
 
 
 @pytest.fixture
-def standard_linear_w8_artifact(tmp_path):
+def standard_linear_w8_artifact(tmp_path, monkeypatch):
     from llmcompressor.transformers.compression.compressed_tensors_utils import (
         modify_save_pretrained,
     )
 
+    monkeypatch.setattr(
+        rwkv7_module,
+        "validate_rwkv7_transformers_provenance",
+        _runtime_provenance,
+    )
     model = _tiny_standard_rwkv7().eval()
     modifier = build_rwkv7_quantization_recipe(
         model,
