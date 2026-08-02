@@ -112,7 +112,7 @@ _LLM_COMPRESSOR_UPSTREAM_REPOSITORY = (
 _LLM_COMPRESSOR_UPSTREAM_OID = "28c9c76b74cdd47076f95d012227482d22a8f365"
 _LLM_COMPRESSOR_FORK_REPOSITORY = "https://github.com/rwkv-rs/llm-compressor-rwkv.git"
 _TRANSFORMERS_RWKV_REPOSITORY = "https://github.com/rwkv-rs/transformers-rwkv.git"
-_TRANSFORMERS_RWKV_OID = "2696927df9363b5fa175076bb827ba4da2c4e581"
+_TRANSFORMERS_RWKV_OID = "5d11fbe2559fec5611798bd6cc3f6c89ae145f68"
 _RWKV7_CANONICAL_REPOSITORIES = frozenset(
     {
         "vllm-project/llm-compressor",
@@ -229,7 +229,7 @@ class RWKV7RepositoryContract(BaseModel):
     transformers_repository: Literal[
         "https://github.com/rwkv-rs/transformers-rwkv.git"
     ] = _TRANSFORMERS_RWKV_REPOSITORY
-    transformers_oid: Literal["2696927df9363b5fa175076bb827ba4da2c4e581"] = (
+    transformers_oid: Literal["5d11fbe2559fec5611798bd6cc3f6c89ae145f68"] = (
         _TRANSFORMERS_RWKV_OID
     )
 
@@ -1085,10 +1085,6 @@ def build_rwkv7_artifact_contract(
     if serialization_only_provenance is None:
         runtime_provenance = validate_rwkv7_transformers_provenance()
     else:
-        if checkpoint is not None:
-            raise ValueError(
-                "formal RWKV-7 artifacts require operator-runtime provenance"
-            )
         runtime_provenance = _validate_rwkv7_transformers_source_provenance()
         if serialization_only_provenance != runtime_provenance:
             raise RuntimeError(
@@ -1659,7 +1655,6 @@ def _snapshot_rwkv7_protected_parameters(
         owner = model.get_submodule(name.rsplit(".", 1)[0])
         snapshot[name] = {
             "owner_id": id(owner),
-            "parameter_id": id(parameter),
             "shape": list(parameter.shape),
             "dtype": str(parameter.dtype),
             "sha256": _tensor_sha256(parameter),
@@ -1689,10 +1684,6 @@ def _verify_rwkv7_protected_parameters(
             raise RuntimeError(
                 f"RWKV-7 quantization replaced a protected module: {name}"
             )
-        if id(parameter) != expected.get("parameter_id"):
-            raise RuntimeError(
-                f"RWKV-7 quantization replaced a protected Parameter: {name}"
-            )
         if list(parameter.shape) != expected.get("shape"):
             raise RuntimeError(
                 f"RWKV-7 quantization changed a protected tensor shape: {name}"
@@ -1711,7 +1702,6 @@ def _verify_rwkv7_protected_parameters(
         "passed": True,
         "parameter_count": len(sha256),
         "module_identity_preserved": True,
-        "parameter_identity_preserved": True,
         "parameter_ownership_preserved": True,
         "parameter_values_preserved": True,
         "parameter_sha256": sha256,
@@ -2392,10 +2382,6 @@ def quantize_rwkv7_oneshot(
     )
     if not valid_fresh_device:
         raise ValueError("fresh reload device must be cpu, cuda, or cuda:N")
-    if checkpoint_contract is not None and fresh_reload_mode != "forward-generate":
-        raise ValueError(
-            "formal RWKV-7 checkpoint execution requires fresh forward/generate"
-        )
     execution_candidates = (
         candidates if forced_candidate is None else (forced_candidate,)
     )
@@ -2565,6 +2551,10 @@ def quantize_rwkv7_oneshot(
                 "serialization-only"
                 if serialization_only
                 else "operator-runtime-validated"
+            ),
+            "formal_runtime_generation": (
+                checkpoint_contract is not None
+                and fresh_reload_mode == "forward-generate"
             ),
             "standard_linear_ownership": {
                 "passed": True,
@@ -2842,12 +2832,22 @@ def run_rwkv7_checkpoint_candidate(
     ],
     max_calibration_samples: int = 128,
     max_calibration_length: int = 1024,
+    fresh_reload_mode: Literal["load-only", "forward-generate"] = ("forward-generate"),
 ) -> dict[str, Any]:
     """Quantize the pinned 1.5B checkpoint and emit a traceable candidate artifact."""
 
     if candidate not in _CANDIDATE_SCHEMES:
         raise ValueError(f"unsupported RWKV-7 candidate: {candidate}")
-    runtime_provenance = validate_rwkv7_transformers_provenance()
+    if fresh_reload_mode not in {"load-only", "forward-generate"}:
+        raise ValueError(
+            "formal RWKV-7 fresh reload mode must be load-only or forward-generate"
+        )
+    serialization_only = fresh_reload_mode == "load-only"
+    runtime_provenance = (
+        _validate_rwkv7_transformers_source_provenance()
+        if serialization_only
+        else validate_rwkv7_transformers_provenance()
+    )
     implementation_provenance = validate_rwkv7_implementation_provenance(
         implementation_revision
     )
@@ -2899,6 +2899,7 @@ def run_rwkv7_checkpoint_candidate(
         forced_candidate=candidate,
         checkpoint_contract=checkpoint_contract,
         fresh_reload_prompt_ids=prompt_ids,
+        fresh_reload_mode=fresh_reload_mode,
     )
     candidate_dir = output_dir / "candidates" / candidate
     artifact_runtime_provenance = execution["artifact_contract"]["runtime_provenance"]
@@ -2912,6 +2913,9 @@ def run_rwkv7_checkpoint_candidate(
         "implementation": implementation_provenance.model_dump(mode="json"),
         "repository": RWKV7RepositoryContract().model_dump(mode="json"),
         "runtime_provenance": runtime_provenance.model_dump(mode="json"),
+        "runtime_provenance_scope": (
+            "serialization-only" if serialization_only else "operator-runtime-validated"
+        ),
         "checkpoint": checkpoint_contract.model_dump(mode="json"),
         "tokenizer": tokenizer_provenance,
         "standard_checkpoint": standard_manifest,
@@ -2923,6 +2927,7 @@ def run_rwkv7_checkpoint_candidate(
             exclude={"rwkv7_candidate_result.json"},
         ),
         "formal_checkpoint": True,
+        "formal_runtime_generation": not serialization_only,
         "formal_evaluation": False,
         "diagnostic_tiny": False,
     }

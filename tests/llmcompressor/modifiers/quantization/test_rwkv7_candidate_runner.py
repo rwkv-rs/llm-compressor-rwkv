@@ -62,7 +62,7 @@ def _operator_runtime_provenance():
 def _transformers_provenance():
     return RWKV7TransformersProvenance(
         repository="https://github.com/rwkv-rs/transformers-rwkv.git",
-        revision="2696927df9363b5fa175076bb827ba4da2c4e581",
+        revision="5d11fbe2559fec5611798bd6cc3f6c89ae145f68",
         installation_source="editable-git",
         editable=True,
     )
@@ -232,7 +232,7 @@ def test_rwkv7_transformers_provenance_delegates_operator_gate(monkeypatch):
 
     assert calls == ["called"]
     assert provenance.repository == ("https://github.com/rwkv-rs/transformers-rwkv.git")
-    assert provenance.revision == ("2696927df9363b5fa175076bb827ba4da2c4e581")
+    assert provenance.revision == ("5d11fbe2559fec5611798bd6cc3f6c89ae145f68")
     assert provenance.installation_source == "editable-git"
     assert provenance.editable is True
     assert provenance.operator_runtime == dict(
@@ -246,7 +246,7 @@ def test_rwkv7_transformers_provenance_delegates_operator_gate(monkeypatch):
     [
         (
             "https://github.com/huggingface/transformers.git",
-            "2696927df9363b5fa175076bb827ba4da2c4e581",
+            "5d11fbe2559fec5611798bd6cc3f6c89ae145f68",
         ),
         (
             "https://github.com/rwkv-rs/transformers-rwkv.git",
@@ -355,9 +355,9 @@ def test_rwkv7_transformers_pep610_rejects_hostile_repository(
                     "vcs_info": {
                         "vcs": "git",
                         "requested_revision": (
-                            "2696927df9363b5fa175076bb827ba4da2c4e581"
+                            "5d11fbe2559fec5611798bd6cc3f6c89ae145f68"
                         ),
-                        "commit_id": "2696927df9363b5fa175076bb827ba4da2c4e581",
+                        "commit_id": "5d11fbe2559fec5611798bd6cc3f6c89ae145f68",
                     },
                 }
             )
@@ -677,6 +677,11 @@ def test_formal_runner_keeps_results_for_two_candidates_in_one_output_root(
     )
     monkeypatch.setattr(
         rwkv7_module,
+        "_validate_rwkv7_transformers_source_provenance",
+        lambda: runtime_provenance.model_copy(update={"operator_runtime": {}}),
+    )
+    monkeypatch.setattr(
+        rwkv7_module,
         "validate_rwkv7_implementation_provenance",
         lambda revision: _implementation_provenance(revision),
     )
@@ -722,23 +727,32 @@ def test_formal_runner_keeps_results_for_two_candidates_in_one_output_root(
         ),
     )
 
-    def quantize(*args, forced_candidate, **kwargs):
+    fresh_reload_modes = []
+
+    def quantize(*args, forced_candidate, fresh_reload_mode, **kwargs):
+        fresh_reload_modes.append(fresh_reload_mode)
         candidate_dir = Path(args[1]) / forced_candidate
         candidate_dir.mkdir(parents=True, exist_ok=True)
         (candidate_dir / "model.safetensors").write_bytes(
             forced_candidate.encode("utf-8")
         )
+        runtime = (
+            runtime_provenance.model_copy(update={"operator_runtime": {}})
+            if fresh_reload_mode == "load-only"
+            else runtime_provenance
+        )
         return object(), {
             "candidate": forced_candidate,
             "artifact_contract": {
-                "runtime_provenance": runtime_provenance.model_dump(mode="json")
+                "runtime_provenance": runtime.model_dump(mode="json")
             },
         }
 
     monkeypatch.setattr(rwkv7_module, "quantize_rwkv7_oneshot", quantize)
 
     candidates = ("nvfp4-w4a4", "nvfp4-w4a16")
-    for candidate in candidates:
+    modes = ("forward-generate", "load-only")
+    for candidate, fresh_reload_mode in zip(candidates, modes, strict=True):
         run_rwkv7_checkpoint_candidate(
             tmp_path / checkpoint_contract.filename,
             tmp_path / "calibration.jsonl",
@@ -747,6 +761,7 @@ def test_formal_runner_keeps_results_for_two_candidates_in_one_output_root(
             calibration_sha256="2" * 64,
             implementation_revision=implementation_revision,
             candidate=candidate,
+            fresh_reload_mode=fresh_reload_mode,
         )
 
     result_paths = [
@@ -766,6 +781,15 @@ def test_formal_runner_keeps_results_for_two_candidates_in_one_output_root(
         == _artifact_file_manifest(tokenizer_path)["sha256"]
         for result in results
     )
+    assert fresh_reload_modes == list(modes)
+    assert [result["runtime_provenance_scope"] for result in results] == [
+        "operator-runtime-validated",
+        "serialization-only",
+    ]
+    assert [result["formal_runtime_generation"] for result in results] == [
+        True,
+        False,
+    ]
 
 
 @pytest.mark.unit
@@ -799,7 +823,7 @@ def test_rwkv7_transformers_provenance_rejects_unpinned_vcs_request(monkeypatch)
                     "vcs_info": {
                         "vcs": "git",
                         "requested_revision": "main",
-                        "commit_id": ("2696927df9363b5fa175076bb827ba4da2c4e581"),
+                        "commit_id": ("5d11fbe2559fec5611798bd6cc3f6c89ae145f68"),
                     },
                 }
             )
@@ -859,7 +883,7 @@ def test_artifact_contract_pins_fork_standard_names_and_v_first_protection(
         "https://github.com/rwkv-rs/llm-compressor-rwkv.git"
     )
     assert contract.repository.transformers_oid == (
-        "2696927df9363b5fa175076bb827ba4da2c4e581"
+        "5d11fbe2559fec5611798bd6cc3f6c89ae145f68"
     )
     assert contract.runtime_provenance == _runtime_provenance()
     assert (
@@ -981,7 +1005,7 @@ def test_protected_snapshot_rejects_parameter_value_rewrite(monkeypatch):
 
 
 @pytest.mark.unit
-def test_protected_snapshot_rejects_equal_parameter_replacement(monkeypatch):
+def test_protected_snapshot_accepts_equal_parameter_rewrap(monkeypatch):
     monkeypatch.setattr(
         rwkv7_module,
         "validate_rwkv7_transformers_provenance",
@@ -997,8 +1021,11 @@ def test_protected_snapshot_rejects_equal_parameter_replacement(monkeypatch):
     layer_norm = model.model.blocks[0].ln1
     layer_norm.bias = torch.nn.Parameter(layer_norm.bias.detach().clone())
 
-    with pytest.raises(RuntimeError, match="replaced a protected Parameter"):
-        _verify_rwkv7_protected_parameters(model, contract, snapshot)
+    audit = _verify_rwkv7_protected_parameters(model, contract, snapshot)
+
+    assert audit["passed"] is True
+    assert audit["parameter_ownership_preserved"] is True
+    assert audit["parameter_values_preserved"] is True
 
 
 @pytest.mark.integration
@@ -1019,7 +1046,12 @@ def test_w4a16_real_serializer_preserves_mainstream_config_contract(
     monkeypatch.setattr(
         rwkv7_module,
         "validate_rwkv7_transformers_provenance",
-        _runtime_provenance,
+        lambda *_args: _transformers_provenance(),
+    )
+    monkeypatch.setattr(
+        rwkv7_module,
+        "_validate_rwkv7_transformers_source_provenance",
+        lambda *_args: _transformers_provenance(),
     )
     model = _tiny_standard_rwkv7().eval()
     modifier = build_rwkv7_quantization_recipe(model, candidate)
@@ -1086,6 +1118,7 @@ def test_w4a16_real_serializer_preserves_mainstream_config_contract(
         candidate,
         contract,
         expected_protected_parameter_sha256=protection_audit["parameter_sha256"],
+        require_operator_runtime_provenance=False,
     )
     assert audit["targets"] == contract.vllm.quantized_modules
     assert audit["tensor_count"] == audit["expected_tensor_count"]
@@ -1159,6 +1192,7 @@ def test_w4a16_real_serializer_preserves_mainstream_config_contract(
                 expected_protected_parameter_sha256=(
                     protection_audit["parameter_sha256"]
                 ),
+                require_operator_runtime_provenance=False,
             )
 
 

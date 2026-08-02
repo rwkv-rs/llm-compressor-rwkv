@@ -36,6 +36,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-calibration-samples", type=int, default=128)
     parser.add_argument("--max-calibration-length", type=int, default=1024)
+    parser.add_argument(
+        "--fresh-reload-mode",
+        choices=("load-only", "forward-generate"),
+        default="forward-generate",
+        help=(
+            "Use load-only to produce a source-provenance-bound candidate artifact "
+            "before the pinned operator runtime is available."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -51,6 +60,7 @@ def main() -> None:
         candidate=args.candidate,
         max_calibration_samples=args.max_calibration_samples,
         max_calibration_length=args.max_calibration_length,
+        fresh_reload_mode=args.fresh_reload_mode,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 

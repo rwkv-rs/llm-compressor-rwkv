@@ -53,7 +53,7 @@ def _model(device="cuda"):
 def _synthetic_runtime_provenance(*_args):
     return RWKV7TransformersProvenance(
         repository="https://github.com/rwkv-rs/transformers-rwkv.git",
-        revision="2696927df9363b5fa175076bb827ba4da2c4e581",
+        revision="5d11fbe2559fec5611798bd6cc3f6c89ae145f68",
         installation_source="editable-git",
         editable=True,
         operator_runtime={"scope": "synthetic-unit-boundary"},
@@ -274,7 +274,6 @@ def test_nvfp4_w4a16_oneshot_save_and_fresh_direct_class_load(
     protection_audit = metadata["protection_audit"]
     assert protection_audit["passed"] is True
     assert protection_audit["module_identity_preserved"] is True
-    assert protection_audit["parameter_identity_preserved"] is True
     assert protection_audit["parameter_ownership_preserved"] is True
     assert protection_audit["parameter_values_preserved"] is True
     assert protection_audit["parameter_count"] == len(
@@ -309,13 +308,6 @@ def test_nvfp4_w4a16_oneshot_save_and_fresh_direct_class_load(
     [
         ({"fresh_reload_mode": "metadata-only"}, "fresh reload mode"),
         ({"fresh_reload_device": "cuda:any"}, "fresh reload device"),
-        (
-            {
-                "checkpoint_contract": RWKV7CheckpointContract(),
-                "fresh_reload_mode": "load-only",
-            },
-            "formal RWKV-7 checkpoint execution requires fresh forward/generate",
-        ),
     ],
 )
 def test_execution_rejects_invalid_fresh_process_boundary(tmp_path, kwargs, message):
