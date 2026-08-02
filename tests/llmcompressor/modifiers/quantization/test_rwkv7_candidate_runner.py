@@ -4,6 +4,7 @@ import hashlib
 import json
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,12 +14,17 @@ from llmcompressor.core import Event, EventType, State
 from llmcompressor.modifiers.quantization.rwkv7 import (
     RWKV7ArtifactContract,
     RWKV7CheckpointContract,
+    RWKV7ImplementationProvenance,
     RWKV7TransformersProvenance,
+    _artifact_file_manifest,
     _fresh_reload_generate_script,
     _load_calibration_records,
+    _prepare_standard_rwkv7_checkpoint,
     audit_rwkv7_quantized_checkpoint,
     build_rwkv7_artifact_contract,
     build_rwkv7_quantization_recipe,
+    run_rwkv7_checkpoint_candidate,
+    validate_rwkv7_implementation_provenance,
     validate_rwkv7_transformers_provenance,
     verify_rwkv7_checkpoint,
 )
@@ -57,6 +63,13 @@ def _transformers_provenance():
 def _runtime_provenance(*_args):
     return _transformers_provenance().model_copy(
         update={"operator_runtime": _operator_runtime_provenance()}
+    )
+
+
+def _implementation_provenance(revision="f" * 40):
+    return RWKV7ImplementationProvenance(
+        repository="https://github.com/rwkv-rs/llm-compressor-rwkv.git",
+        revision=revision,
     )
 
 
@@ -269,6 +282,147 @@ def test_rwkv7_editable_provenance_rejects_repo_local_shadow_module(
 
     with pytest.raises(RuntimeError, match="does not belong to the editable"):
         rwkv7_module._installed_transformers_provenance()
+
+
+@pytest.mark.unit
+def test_rwkv7_implementation_provenance_binds_clean_editable_checkout(
+    tmp_path, monkeypatch
+):
+    import llmcompressor
+
+    repository_root = tmp_path / "llm-compressor-rwkv"
+    module_path = repository_root / "src/llmcompressor/__init__.py"
+    module_path.parent.mkdir(parents=True)
+    module_path.write_text("", encoding="utf-8")
+    revision = "f" * 40
+
+    class _EditableDistribution:
+        metadata = {"Name": "llmcompressor"}
+
+        @staticmethod
+        def read_text(filename):
+            assert filename == "direct_url.json"
+            return json.dumps(
+                {
+                    "url": repository_root.as_uri(),
+                    "dir_info": {"editable": True},
+                }
+            )
+
+    def git_value(source, *arguments):
+        assert source == repository_root
+        values = {
+            ("rev-parse", "--show-toplevel"): str(repository_root),
+            ("remote", "get-url", "origin"): (
+                "https://github.com/rwkv-rs/llm-compressor-rwkv.git"
+            ),
+            ("rev-parse", "HEAD"): revision,
+        }
+        return values[arguments]
+
+    monkeypatch.setattr(
+        rwkv7_module.importlib_metadata,
+        "distribution",
+        lambda name: _EditableDistribution(),
+    )
+    monkeypatch.setattr(llmcompressor, "__file__", str(module_path))
+    monkeypatch.setattr(rwkv7_module, "_git_provenance_value", git_value)
+    monkeypatch.setattr(
+        rwkv7_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=""),
+    )
+
+    provenance = validate_rwkv7_implementation_provenance(revision)
+
+    assert provenance == _implementation_provenance(revision)
+    with pytest.raises(RuntimeError, match="differs from the active checkout"):
+        validate_rwkv7_implementation_provenance("e" * 40)
+
+
+@pytest.mark.unit
+def test_formal_runner_fails_provenance_before_output_mutation(tmp_path, monkeypatch):
+    output_dir = tmp_path / "result"
+    monkeypatch.setattr(
+        rwkv7_module,
+        "validate_rwkv7_transformers_provenance",
+        _runtime_provenance,
+    )
+
+    def reject_implementation(*args, **kwargs):
+        raise RuntimeError("implementation provenance unavailable")
+
+    monkeypatch.setattr(
+        rwkv7_module,
+        "validate_rwkv7_implementation_provenance",
+        reject_implementation,
+    )
+
+    with pytest.raises(RuntimeError, match="implementation provenance unavailable"):
+        run_rwkv7_checkpoint_candidate(
+            tmp_path / "checkpoint.pth",
+            tmp_path / "calibration.jsonl",
+            output_dir,
+            calibration_sha256="0" * 64,
+            implementation_revision="f" * 40,
+            candidate="nvfp4-w4a4",
+        )
+    assert not output_dir.exists()
+
+
+@pytest.mark.unit
+def test_standard_checkpoint_reuse_binds_converter_provenance_and_manifest(
+    tmp_path, monkeypatch
+):
+    import transformers
+
+    destination = tmp_path / "baseline-standard-hf"
+    destination.mkdir()
+    (destination / "config.json").write_text("{}\n", encoding="utf-8")
+    (destination / "model.safetensors").write_bytes(b"synthetic")
+    checkpoint_contract = RWKV7CheckpointContract()
+    runtime_provenance = _runtime_provenance()
+    implementation_provenance = _implementation_provenance()
+    provenance = {
+        "schema_version": 2,
+        "checkpoint": checkpoint_contract.model_dump(mode="json"),
+        "converter_runtime": runtime_provenance.model_dump(mode="json"),
+        "implementation": implementation_provenance.model_dump(mode="json"),
+        "artifact_manifest": _artifact_file_manifest(destination),
+    }
+    provenance_path = destination / "rwkv7_source_provenance.json"
+    provenance_path.write_text(
+        json.dumps(provenance, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        transformers.AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: SimpleNamespace(
+            model_type="rwkv7",
+            architectures=["Rwkv7ForCausalLM"],
+            embedding_layer_norm_fused=False,
+        ),
+    )
+
+    manifest = _prepare_standard_rwkv7_checkpoint(
+        tmp_path / checkpoint_contract.filename,
+        destination,
+        checkpoint_contract,
+        runtime_provenance,
+        implementation_provenance,
+    )
+    assert manifest["file_count"] == 3
+
+    (destination / "config.json").write_text('{"tampered": true}\n', encoding="utf-8")
+    with pytest.raises(RuntimeError, match="provenance or manifest drifted"):
+        _prepare_standard_rwkv7_checkpoint(
+            tmp_path / checkpoint_contract.filename,
+            destination,
+            checkpoint_contract,
+            runtime_provenance,
+            implementation_provenance,
+        )
 
 
 @pytest.mark.unit

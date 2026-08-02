@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 
 from llmcompressor.modifiers.quantization.rwkv7 import (
     RWKV7CheckpointContract,
+    RWKV7TransformersProvenance,
     _fresh_reload_generate_script,
     quantize_rwkv7_oneshot,
 )
@@ -45,6 +46,16 @@ def _model(device="cuda"):
     )
 
 
+def _synthetic_runtime_provenance(*_args):
+    return RWKV7TransformersProvenance(
+        repository="https://github.com/rwkv-rs/transformers-rwkv.git",
+        revision="2696927df9363b5fa175076bb827ba4da2c4e581",
+        installation_source="editable-git",
+        editable=True,
+        operator_runtime={"scope": "synthetic-unit-boundary"},
+    )
+
+
 @pytest.mark.unit
 def test_fresh_reload_program_is_valid_python():
     compile(_fresh_reload_generate_script(), "<rwkv7-fresh-reload>", "exec")
@@ -69,7 +80,7 @@ def test_execution_falls_back_only_in_closed_order(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "llmcompressor.modifiers.quantization.rwkv7."
         "validate_rwkv7_transformers_provenance",
-        lambda *args: None,
+        _synthetic_runtime_provenance,
     )
     monkeypatch.setattr(
         "subprocess.run",
@@ -101,7 +112,7 @@ def test_formal_execution_rejects_a_failed_fresh_process_reload(
     monkeypatch.setattr(
         "llmcompressor.modifiers.quantization.rwkv7."
         "validate_rwkv7_transformers_provenance",
-        lambda *args: None,
+        _synthetic_runtime_provenance,
     )
     monkeypatch.setattr(
         "subprocess.run",

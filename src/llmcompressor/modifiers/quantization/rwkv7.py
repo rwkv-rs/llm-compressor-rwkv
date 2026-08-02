@@ -24,6 +24,7 @@ __all__ = [
     "QuantizationTargetPolicyMetadata",
     "RWKV7ArtifactContract",
     "RWKV7CheckpointContract",
+    "RWKV7ImplementationProvenance",
     "RWKV7QuantizationRecipeMetadata",
     "RWKV7RepositoryContract",
     "RWKV7TransformersProvenance",
@@ -34,6 +35,7 @@ __all__ = [
     "quantize_rwkv7_oneshot",
     "run_rwkv7_checkpoint_candidate",
     "validate_rwkv7_transformers_provenance",
+    "validate_rwkv7_implementation_provenance",
     "verify_rwkv7_checkpoint",
 ]
 
@@ -152,6 +154,25 @@ class RWKV7TransformersProvenance(BaseModel):
     def validate_revision(self) -> RWKV7TransformersProvenance:
         if re.fullmatch(r"[0-9a-f]{40}", self.revision) is None:
             raise ValueError("RWKV-7 Transformers provenance requires a full Git OID")
+        return self
+
+
+class RWKV7ImplementationProvenance(BaseModel):
+    """Observed editable llm-compressor fork implementation identity."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    repository: str
+    revision: str
+    installation_source: Literal["editable-git"] = "editable-git"
+    editable: Literal[True] = True
+
+    @model_validator(mode="after")
+    def validate_revision(self) -> RWKV7ImplementationProvenance:
+        if re.fullmatch(r"[0-9a-f]{40}", self.revision) is None:
+            raise ValueError(
+                "RWKV-7 llm-compressor provenance requires a full Git OID"
+            )
         return self
 
 
@@ -358,6 +379,94 @@ def validate_rwkv7_transformers_provenance(
         validate_rwkv7_runtime_provenance()
     )
     return observed.model_copy(update={"operator_runtime": operator_runtime})
+
+
+def validate_rwkv7_implementation_provenance(
+    implementation_revision: str,
+    contract: RWKV7RepositoryContract | None = None,
+) -> RWKV7ImplementationProvenance:
+    """Bind formal candidate evidence to this clean llm-compressor checkout."""
+
+    if re.fullmatch(r"[0-9a-f]{40}", implementation_revision) is None:
+        raise ValueError("implementation_revision must be a full lowercase Git OID")
+    expected = RWKV7RepositoryContract() if contract is None else contract
+    requirement = (
+        "formal RWKV-7 execution requires a clean editable "
+        "rwkv-rs/llm-compressor-rwkv checkout"
+    )
+    try:
+        distribution = importlib_metadata.distribution("llmcompressor")
+    except importlib_metadata.PackageNotFoundError as error:
+        raise RuntimeError(
+            f"{requirement}; distribution metadata is missing"
+        ) from error
+    if distribution.metadata.get("Name") != "llmcompressor":
+        raise RuntimeError(f"{requirement}; distribution identity is invalid")
+    direct_url_text = distribution.read_text("direct_url.json")
+    if direct_url_text is None:
+        raise RuntimeError(f"{requirement}; editable PEP 610 metadata is missing")
+    try:
+        direct_url = json.loads(direct_url_text)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"{requirement}; direct_url.json is invalid") from error
+    directory_info = direct_url.get("dir_info")
+    parsed_source = urlparse(str(direct_url.get("url", "")))
+    if (
+        not isinstance(directory_info, dict)
+        or directory_info.get("editable") is not True
+        or parsed_source.scheme != "file"
+        or parsed_source.netloc not in ("", "localhost")
+    ):
+        raise RuntimeError(f"{requirement}; installation is not a local editable")
+    repository_root = Path(unquote(parsed_source.path)).resolve()
+    if not repository_root.is_dir():
+        raise RuntimeError(f"{requirement}; editable source directory is missing")
+
+    import llmcompressor
+
+    module_path = Path(llmcompressor.__file__).resolve()
+    expected_module_path = repository_root / "src/llmcompressor/__init__.py"
+    if module_path != expected_module_path.resolve():
+        raise RuntimeError(
+            f"{requirement}; imported module does not belong to the editable source"
+        )
+    repository_top_level = Path(
+        _git_provenance_value(repository_root, "rev-parse", "--show-toplevel")
+    ).resolve()
+    if repository_top_level != repository_root:
+        raise RuntimeError(f"{requirement}; editable source is not the Git root")
+    repository = _git_provenance_value(
+        repository_root,
+        "remote",
+        "get-url",
+        "origin",
+    )
+    revision = _git_provenance_value(repository_root, "rev-parse", "HEAD")
+    dirty = subprocess.run(
+        ["git", "-C", str(repository_root), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+    )
+    if dirty.returncode != 0:
+        raise RuntimeError(f"{requirement}; Git status could not be read")
+    if dirty.stdout.strip():
+        raise RuntimeError(f"{requirement}; editable source is dirty")
+    if _canonical_repository_url(repository) != _canonical_repository_url(
+        expected.fork_repository
+    ):
+        raise RuntimeError(
+            "RWKV-7 llm-compressor repository provenance mismatch: "
+            f"expected={expected.fork_repository} actual={repository}"
+        )
+    if revision != implementation_revision:
+        raise RuntimeError(
+            "RWKV-7 implementation revision differs from the active checkout: "
+            f"expected={implementation_revision} actual={revision}"
+        )
+    return RWKV7ImplementationProvenance(
+        repository=repository,
+        revision=revision,
+    )
 
 
 class RWKV7CheckpointContract(BaseModel):
@@ -1566,14 +1675,22 @@ def verify_rwkv7_checkpoint(checkpoint_path: Path) -> RWKV7CheckpointContract:
     return contract
 
 
-def _artifact_file_manifest(directory: Path) -> dict[str, Any]:
+def _artifact_file_manifest(
+    directory: Path,
+    *,
+    exclude: set[str] | None = None,
+) -> dict[str, Any]:
+    excluded = set() if exclude is None else exclude
     files = []
     for path in sorted(
         candidate for candidate in directory.rglob("*") if candidate.is_file()
     ):
+        relative_path = path.relative_to(directory).as_posix()
+        if relative_path in excluded:
+            continue
         files.append(
             {
-                "path": path.relative_to(directory).as_posix(),
+                "path": relative_path,
                 "size_bytes": path.stat().st_size,
                 "sha256": _sha256_file(path),
             }
@@ -1652,17 +1769,34 @@ def _prepare_standard_rwkv7_checkpoint(
     checkpoint_path: Path,
     destination: Path,
     checkpoint_contract: RWKV7CheckpointContract,
+    runtime_provenance: RWKV7TransformersProvenance,
+    implementation_provenance: RWKV7ImplementationProvenance,
 ) -> dict[str, Any]:
     provenance_path = destination / "rwkv7_source_provenance.json"
-    expected_provenance = checkpoint_contract.model_dump(mode="json")
+    provenance_name = provenance_path.name
+    provenance_prefix = {
+        "schema_version": 2,
+        "checkpoint": checkpoint_contract.model_dump(mode="json"),
+        "converter_runtime": runtime_provenance.model_dump(mode="json"),
+        "implementation": implementation_provenance.model_dump(mode="json"),
+    }
     if destination.exists() and any(destination.iterdir()):
         if not provenance_path.is_file():
             raise RuntimeError(
                 "standard checkpoint destination is non-empty without provenance"
             )
         actual_provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        expected_provenance = {
+            **provenance_prefix,
+            "artifact_manifest": _artifact_file_manifest(
+                destination,
+                exclude={provenance_name},
+            ),
+        }
         if actual_provenance != expected_provenance:
-            raise RuntimeError("standard checkpoint provenance does not match source")
+            raise RuntimeError(
+                "standard checkpoint converter provenance or manifest drifted"
+            )
     else:
         destination.mkdir(parents=True, exist_ok=True)
         from transformers.models.rwkv7.convert_rwkv7_checkpoint_to_hf import (
@@ -1676,6 +1810,10 @@ def _prepare_standard_rwkv7_checkpoint(
             safe_serialization=True,
             fuse_embedding_layer_norm=False,
         )
+        expected_provenance = {
+            **provenance_prefix,
+            "artifact_manifest": _artifact_file_manifest(destination),
+        }
         _atomic_json(provenance_path, expected_provenance)
 
     from transformers import AutoConfig
@@ -1712,10 +1850,12 @@ def run_rwkv7_checkpoint_candidate(
 ) -> dict[str, Any]:
     """Quantize the pinned 1.5B checkpoint and emit a traceable candidate artifact."""
 
-    if not re.fullmatch(r"[0-9a-f]{40}", implementation_revision):
-        raise ValueError("implementation_revision must be a full lowercase Git OID")
     if candidate not in _CANDIDATE_SCHEMES:
         raise ValueError(f"unsupported RWKV-7 candidate: {candidate}")
+    runtime_provenance = validate_rwkv7_transformers_provenance()
+    implementation_provenance = validate_rwkv7_implementation_provenance(
+        implementation_revision
+    )
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 12:
         raise RuntimeError("formal RWKV-7 NVFP4 execution requires a Blackwell GPU")
 
@@ -1723,7 +1863,11 @@ def run_rwkv7_checkpoint_candidate(
     output_dir = output_dir.resolve()
     standard_checkpoint = output_dir / "baseline-standard-hf"
     standard_manifest = _prepare_standard_rwkv7_checkpoint(
-        checkpoint_path.resolve(), standard_checkpoint, checkpoint_contract
+        checkpoint_path.resolve(),
+        standard_checkpoint,
+        checkpoint_contract,
+        runtime_provenance,
+        implementation_provenance,
     )
 
     from torch.utils.data import DataLoader
@@ -1760,10 +1904,19 @@ def run_rwkv7_checkpoint_candidate(
         fresh_reload_prompt_ids=prompt_ids,
     )
     candidate_dir = output_dir / "candidates" / candidate
+    artifact_runtime_provenance = execution["artifact_contract"][
+        "runtime_provenance"
+    ]
+    if artifact_runtime_provenance != runtime_provenance.model_dump(mode="json"):
+        raise RuntimeError(
+            "RWKV-7 runtime provenance drifted during formal candidate execution"
+        )
     result = {
         "schema_version": 1,
         "implementation_revision": implementation_revision,
+        "implementation": implementation_provenance.model_dump(mode="json"),
         "repository": RWKV7RepositoryContract().model_dump(mode="json"),
+        "runtime_provenance": runtime_provenance.model_dump(mode="json"),
         "checkpoint": checkpoint_contract.model_dump(mode="json"),
         "standard_checkpoint": standard_manifest,
         "calibration": calibration,
