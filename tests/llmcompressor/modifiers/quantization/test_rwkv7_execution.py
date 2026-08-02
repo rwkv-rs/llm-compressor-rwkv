@@ -184,8 +184,8 @@ def test_gb10_real_nvfp4_checkpoint_has_packed_tensors_and_forward(
     assert reload_evidence["dtype"] == "torch.bfloat16"
     assert reload_evidence["logits_dtype"] == "torch.bfloat16"
     assert reload_evidence["quantized_module_count"] == 4
-    assert reload_evidence["protected_module_count"] == 9
-    assert reload_evidence["protected_tensor_count"] == 37
+    assert reload_evidence["protected_module_count"] == 23
+    assert reload_evidence["protected_tensor_count"] == 23
     assert reload_evidence["artifact_contract_validated"] is True
     runtime = reload_evidence["runtime_measurement"]
     assert runtime["scope"] == "fresh-process-transformers-generate-diagnostic"
@@ -197,6 +197,13 @@ def test_gb10_real_nvfp4_checkpoint_has_packed_tensors_and_forward(
     assert artifact_contract["formal_evaluation"] is False
     assert artifact_contract["vllm"]["source_format"] == "standard_hf"
     assert artifact_contract["vllm"]["legacy_pth_direct_load"] is False
+    assert artifact_contract["vllm"]["linear_weight_suffix"] == "weight"
+    assert artifact_contract["vllm"]["linear_weight_layout"] == "out-in"
+    assert artifact_contract["vllm"]["quantized_low_rank_modules"] == []
+    assert artifact_contract["vllm"]["protected_v_first_linear_modules"] == [
+        "model.blocks.1.att.v1",
+        "model.blocks.1.att.v2",
+    ]
     assert "model.blocks.0.att.value" in artifact_contract["vllm"][
         "protected_modules"
     ]

@@ -132,8 +132,9 @@ class QuantizationMixin(HooksMixin):
         recipes. This field is recomputed from the current model before quantization.
     :param target_policy_profile: RWKV-7 protection profile. ``critical-high``
         quantizes only ChannelMix projections, ``low-rank-w8-critical-high`` also
-        quantizes raw w/a/g low-rank Parameters, and ``v-first-dataflow`` is the
-        explicit protection ablation. Every profile protects v_first.
+        quantizes standard w/a/g low-rank Linear weights, and
+        ``v-first-dataflow`` is the explicit protection ablation. Every profile
+        protects v_first.
     """
 
     config_groups: dict[str, QuantizationScheme] | None = None

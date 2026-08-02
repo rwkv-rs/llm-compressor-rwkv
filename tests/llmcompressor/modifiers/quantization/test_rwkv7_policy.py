@@ -35,21 +35,22 @@ class _TimeMix(torch.nn.Module):
             "x_a",
             "x_g",
             "w0",
-            "w1",
-            "w2",
             "a0",
-            "a1",
-            "a2",
-            "g1",
-            "g2",
             "k_k",
             "k_a",
             "r_k",
         ):
             setattr(self, name, torch.nn.Parameter(torch.zeros(hidden_size)))
+        for name in ("w1", "w2", "a1", "a2", "g1", "g2"):
+            setattr(
+                self,
+                name,
+                torch.nn.Linear(hidden_size, hidden_size, bias=False),
+            )
         if layer_id > 0:
-            for name in ("v0", "v1", "v2"):
-                setattr(self, name, torch.nn.Parameter(torch.zeros(hidden_size)))
+            self.v0 = torch.nn.Parameter(torch.zeros(hidden_size))
+            self.v1 = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+            self.v2 = torch.nn.Linear(hidden_size, hidden_size, bias=False)
         self.receptance = torch.nn.Linear(hidden_size, hidden_size, bias=False)
         self.key = torch.nn.Linear(hidden_size, hidden_size, bias=False)
         self.value = torch.nn.Linear(hidden_size, hidden_size, bias=False)
@@ -129,7 +130,10 @@ def test_rwkv7_policy_selects_channel_mix_and_records_recurrent_protections():
 
     assert metadata.base_model_prefix == "model"
     assert ignore == [
-        r"re:^model\.blocks\.\d+\.att\.(receptance|key|value|output)$",
+        (
+            r"re:^model\.blocks\.\d+\.att\."
+            r"(receptance|key|value|output|w1|w2|a1|a2|g1|g2|v1|v2)$"
+        ),
         "head",
     ]
     assert metadata.selection.names == [
@@ -144,10 +148,12 @@ def test_rwkv7_policy_selects_channel_mix_and_records_recurrent_protections():
     assert metadata.protections[0].names == ["model.blocks.0.att.value"]
     assert "produces v_first" in metadata.protections[0].reason
     assert metadata.protections[2].names == [
-        "model.blocks.1.att.v0",
         "model.blocks.1.att.v1",
         "model.blocks.1.att.v2",
     ]
+    assert metadata.protections[2].kind == "module"
+    assert metadata.protections[3].names == ["model.blocks.1.att.v0"]
+    assert metadata.protections[3].kind == "tensor"
     recurrent = metadata.protections[-1]
     assert recurrent.kind == "tensor"
     assert "model.blocks.0.att.x_r" in recurrent.names
@@ -246,9 +252,9 @@ def _tiny_standard_rwkv7():
         Rwkv7Config(
             vocab_size=32,
             context_length=16,
-            hidden_size=16,
+            hidden_size=32,
             num_hidden_layers=2,
-            intermediate_size=32,
+            intermediate_size=64,
             head_size=8,
         )
     )
@@ -297,7 +303,7 @@ def _tiny_standard_rwkv7():
             "w8a16-low-rank-critical-high",
             "INT8",
             "int8",
-            128,
+            32,
             "float16",
             "none",
             "low-rank-w8-critical-high",
@@ -347,13 +353,17 @@ def test_protection_ablation_quantizes_non_value_timemix_but_keeps_v_first(
     metadata = modifier.target_policy_metadata
 
     assert modifier.ignore == [
-        r"re:^model\.blocks\.\d+\.att\.value$",
+        r"re:^model\.blocks\.\d+\.att\.(value|v1|v2)$",
         "head",
     ]
     assert "model.blocks.0.att.value" not in metadata.selection.names
     assert "model.blocks.1.att.value" not in metadata.selection.names
     assert "model.blocks.0.att.receptance" in metadata.selection.names
     assert "model.blocks.1.att.output" in metadata.selection.names
+    assert "model.blocks.0.att.w1" in metadata.selection.names
+    assert "model.blocks.1.att.g2" in metadata.selection.names
+    assert "model.blocks.1.att.v1" not in metadata.selection.names
+    assert "model.blocks.1.att.v2" not in metadata.selection.names
     protected_modules = {
         name
         for decision in metadata.protections
@@ -363,6 +373,8 @@ def test_protection_ablation_quantizes_non_value_timemix_but_keeps_v_first(
     assert {
         "model.blocks.0.att.value",
         "model.blocks.1.att.value",
+        "model.blocks.1.att.v1",
+        "model.blocks.1.att.v2",
         "head",
     } <= protected_modules
     protected_tensors = {
@@ -372,30 +384,33 @@ def test_protection_ablation_quantizes_non_value_timemix_but_keeps_v_first(
         for name in decision.names
     }
     assert "model.blocks.1.att.v0" in protected_tensors
-    assert "model.blocks.1.att.v2" in protected_tensors
+    assert "model.blocks.1.att.v2" not in protected_tensors
 
 
 @pytest.mark.unit
-def test_low_rank_w8_selects_wag_parameters_but_protects_v_first(
+def test_low_rank_w8_selects_standard_wag_linears_but_protects_v_first(
     real_rwkv7_types,
 ):
+    model = _tiny_standard_rwkv7()
     modifier = build_rwkv7_quantization_recipe(
-        _tiny_standard_rwkv7(),
+        model,
         "w8a16-low-rank-critical-high",
     )
     metadata = modifier.target_policy_metadata
 
-    assert metadata.parameter_selection is not None
-    assert metadata.parameter_selection.kind == "tensor"
-    assert metadata.parameter_selection.names == [
+    low_rank_modules = [
         f"model.blocks.{layer}.att.{name}"
         for layer in range(2)
         for name in ("w1", "w2", "a1", "a2", "g1", "g2")
     ]
-    assert not any(
-        name.endswith((".v0", ".v1", ".v2"))
-        for name in metadata.parameter_selection.names
+    assert set(low_rank_modules) <= set(metadata.selection.names)
+    assert all(
+        isinstance(model.get_submodule(name), torch.nn.Linear)
+        and model.get_submodule(name).bias is None
+        for name in low_rank_modules
     )
+    assert all(f"{name}.weight" in model.state_dict() for name in low_rank_modules)
+    assert not any(name.endswith((".v1", ".v2")) for name in metadata.selection.names)
     protected_modules = {
         name
         for decision in metadata.protections
@@ -410,11 +425,12 @@ def test_low_rank_w8_selects_wag_parameters_but_protects_v_first(
     }
     assert "model.blocks.0.att.value" in protected_modules
     assert {
-        "model.blocks.1.att.v0",
         "model.blocks.1.att.v1",
         "model.blocks.1.att.v2",
-    } <= protected_tensors
+    } <= protected_modules
+    assert "model.blocks.1.att.v0" in protected_tensors
     assert metadata.recipe.low_rank_weight_dtype == "int8"
+    assert modifier.bypass_divisibility_checks is False
 
 
 @pytest.mark.unit
