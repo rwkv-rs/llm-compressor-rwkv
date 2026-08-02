@@ -1,8 +1,7 @@
 import json
 import os
-import re
+import shutil
 import tempfile
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -13,29 +12,13 @@ from llmcompressor.modifiers.quantization.rwkv7 import quantize_rwkv7_oneshot
 
 
 @pytest.fixture
-def cleanup_owned_nvcc_temporary_paths():
-    root = Path(tempfile.gettempdir())
-    owned_pattern = re.compile(r"^(tmpxft_|cc).+|^tmp.+\.build-temp$")
-
-    def owned_paths():
-        paths = set()
-        for path in root.iterdir():
-            if not owned_pattern.fullmatch(path.name):
-                continue
-            paths.add(path)
-            if path.is_dir():
-                paths.update(path.rglob("*"))
-        return paths
-
-    before = owned_paths()
-    yield
-    created = owned_paths() - before
-    for path in sorted(created, key=lambda item: len(item.parts), reverse=True):
-        if path.is_dir():
-            if not any(path.iterdir()):
-                path.rmdir()
-        else:
-            path.unlink()
+def owned_process_tmpdir(tmp_path, monkeypatch):
+    process_tmpdir = tmp_path / "process-tmp"
+    process_tmpdir.mkdir()
+    monkeypatch.setenv("TMPDIR", str(process_tmpdir))
+    monkeypatch.setattr(tempfile, "tempdir", str(process_tmpdir))
+    yield process_tmpdir
+    shutil.rmtree(process_tmpdir, ignore_errors=True)
 
 
 def _model(device="cuda"):
@@ -100,7 +83,7 @@ def test_execution_falls_back_only_in_closed_order(tmp_path, monkeypatch):
 @pytest.mark.parametrize("candidate", ["nvfp4-w4a4", "nvfp4-w4a16"])
 @pytest.mark.integration
 def test_gb10_real_nvfp4_checkpoint_has_packed_tensors_and_forward(
-    tmp_path, cleanup_owned_nvcc_temporary_paths, candidate
+    tmp_path, owned_process_tmpdir, candidate
 ):
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
@@ -142,13 +125,16 @@ def test_gb10_real_nvfp4_checkpoint_has_packed_tensors_and_forward(
         (tmp_path / candidate / "rwkv7_quantization_execution.json").read_text()
     )
     assert saved == metadata
-    assert metadata["fresh_reload"]["passed"] is False
+    assert metadata["fresh_reload"]["passed"] is True
+    assert metadata["fresh_reload"]["returncode"] == 0
     assert metadata["fresh_reload"]["source_owner"] == "Transformers RWKV7 loader"
     assert (
-        "must bypass Rwkv7PreTrainedModel._init_weights"
+        "standard compressed-tensors dequantization path"
         in metadata["fresh_reload"]["regression_expectation"]
     )
-    assert (
-        "'Linear' object has no attribute 'weight'"
-        in metadata["fresh_reload"]["stderr"]
-    )
+    assert metadata["fresh_reload"]["evidence"] == {
+        "dtype": "torch.bfloat16",
+        "logits_dtype": "torch.bfloat16",
+        "quantized_module_count": 4,
+        "protected_module_count": 9,
+    }

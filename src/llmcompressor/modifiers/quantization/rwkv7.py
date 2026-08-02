@@ -379,12 +379,52 @@ def quantize_rwkv7_oneshot(
             )
             continue
         reload_script = """
-import sys, torch
-from transformers import AutoModelForCausalLM
-model = AutoModelForCausalLM.from_pretrained(sys.argv[1], device_map='cuda').eval()
+import json, sys, torch
+from transformers import AutoConfig, AutoModelForCausalLM
+from transformers.utils.quantization_config import CompressedTensorsConfig
+
+config = AutoConfig.from_pretrained(sys.argv[1])
+runtime_dtype = config.dtype
+assert isinstance(runtime_dtype, torch.dtype)
+model = AutoModelForCausalLM.from_pretrained(
+    sys.argv[1],
+    device_map='cuda',
+    dtype=runtime_dtype,
+    quantization_config=CompressedTensorsConfig(dequantize=True),
+).to(dtype=runtime_dtype).eval()
+quantized = [
+    module
+    for block in model.model.blocks
+    for module in (block.ffn.key, block.ffn.value)
+]
+protected = [
+    model.head,
+    *[
+        module
+        for block in model.model.blocks
+        for module in (
+            block.att.receptance,
+            block.att.key,
+            block.att.value,
+            block.att.output,
+        )
+    ],
+]
+assert all(
+    getattr(module, 'quantization_scheme', None) is not None for module in quantized
+)
+assert all(module.weight.dtype == runtime_dtype for module in quantized)
+assert all(getattr(module, 'quantization_scheme', None) is None for module in protected)
+assert all(module.weight.dtype == runtime_dtype for module in protected)
 with torch.inference_mode():
     logits = model(torch.tensor([[1, 2, 3, 4]], device='cuda')).logits
 assert torch.isfinite(logits).all()
+print(json.dumps({
+    'dtype': str(runtime_dtype),
+    'logits_dtype': str(logits.dtype),
+    'quantized_module_count': len(quantized),
+    'protected_module_count': len(protected),
+}))
 """
         reload_environment = dict(os.environ)
         reload_temporary = destination / ".fresh-reload-tmp"
@@ -396,6 +436,9 @@ assert torch.isfinite(logits).all()
             text=True,
             env=reload_environment,
         )
+        reload_evidence = None
+        if reload_run.returncode == 0:
+            reload_evidence = json.loads(reload_run.stdout.strip().splitlines()[-1])
         metadata = {
             "schema_version": 1,
             "candidate": candidate,
@@ -412,10 +455,11 @@ assert torch.isfinite(logits).all()
                 "passed": reload_run.returncode == 0,
                 "returncode": reload_run.returncode,
                 "stderr": reload_run.stderr[-8000:],
+                "evidence": reload_evidence,
                 "source_owner": "Transformers RWKV7 loader",
                 "regression_expectation": (
-                    "compressed Linear modules without weight must bypass "
-                    "Rwkv7PreTrainedModel._init_weights"
+                    "the standard compressed-tensors dequantization path must restore "
+                    "packed Linear weights at the checkpoint dtype before forward"
                 ),
             },
             "failures": failures,
