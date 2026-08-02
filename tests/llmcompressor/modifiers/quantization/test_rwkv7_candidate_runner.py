@@ -1,9 +1,11 @@
 """Contracts for formal RWKV-7 checkpoint candidate execution."""
 
 import hashlib
+import importlib
 import json
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -514,6 +516,7 @@ def test_formal_runner_fails_provenance_before_output_mutation(tmp_path, monkeyp
             tmp_path / "checkpoint.pth",
             tmp_path / "calibration.jsonl",
             output_dir,
+            tokenizer_path=tmp_path / "tokenizer",
             calibration_sha256="0" * 64,
             implementation_revision="f" * 40,
             candidate="nvfp4-w4a4",
@@ -528,6 +531,9 @@ def test_standard_checkpoint_reuse_binds_converter_provenance_and_manifest(
     import transformers
 
     destination = tmp_path / "baseline-standard-hf"
+    tokenizer_path = tmp_path / "tokenizer"
+    tokenizer_path.mkdir()
+    (tokenizer_path / "tokenizer.json").write_text("{}\n", encoding="utf-8")
     destination.mkdir()
     (destination / "config.json").write_text("{}\n", encoding="utf-8")
     (destination / "model.safetensors").write_bytes(b"synthetic")
@@ -537,6 +543,10 @@ def test_standard_checkpoint_reuse_binds_converter_provenance_and_manifest(
     provenance = {
         "schema_version": 2,
         "checkpoint": checkpoint_contract.model_dump(mode="json"),
+        "tokenizer": {
+            "source_path": str(tokenizer_path.resolve()),
+            "artifact_manifest": _artifact_file_manifest(tokenizer_path),
+        },
         "converter_runtime": runtime_provenance.model_dump(mode="json"),
         "implementation": implementation_provenance.model_dump(mode="json"),
         "artifact_manifest": _artifact_file_manifest(destination),
@@ -558,6 +568,7 @@ def test_standard_checkpoint_reuse_binds_converter_provenance_and_manifest(
 
     manifest = _prepare_standard_rwkv7_checkpoint(
         tmp_path / checkpoint_contract.filename,
+        tokenizer_path,
         destination,
         checkpoint_contract,
         runtime_provenance,
@@ -569,11 +580,192 @@ def test_standard_checkpoint_reuse_binds_converter_provenance_and_manifest(
     with pytest.raises(RuntimeError, match="provenance or manifest drifted"):
         _prepare_standard_rwkv7_checkpoint(
             tmp_path / checkpoint_contract.filename,
+            tokenizer_path,
             destination,
             checkpoint_contract,
             runtime_provenance,
             implementation_provenance,
         )
+
+
+@pytest.mark.unit
+def test_standard_checkpoint_creation_passes_revision_tokenizer_and_bf16_safetensors(
+    tmp_path, monkeypatch
+):
+    import transformers
+
+    checkpoint_contract = RWKV7CheckpointContract()
+    checkpoint_path = tmp_path / checkpoint_contract.filename
+    tokenizer_path = tmp_path / "standard-fast-tokenizer"
+    tokenizer_path.mkdir()
+    (tokenizer_path / "tokenizer.json").write_text("{}\n", encoding="utf-8")
+    destination = tmp_path / "baseline-standard-hf"
+    conversion_calls = []
+    conversion_module = importlib.import_module(
+        "transformers.models.rwkv7.convert_rwkv7_checkpoint_to_hf"
+    )
+
+    def convert(checkpoint, output, **kwargs):
+        conversion_calls.append((checkpoint, output, kwargs))
+        (destination / "config.json").write_text("{}\n", encoding="utf-8")
+        (destination / "model.safetensors").write_bytes(b"synthetic")
+
+    monkeypatch.setattr(
+        conversion_module,
+        "convert_rwkv7_checkpoint_to_hf_format",
+        convert,
+    )
+    monkeypatch.setattr(
+        transformers.AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: SimpleNamespace(
+            model_type="rwkv7",
+            architectures=["Rwkv7ForCausalLM"],
+            embedding_layer_norm_fused=False,
+        ),
+    )
+
+    _prepare_standard_rwkv7_checkpoint(
+        checkpoint_path,
+        tokenizer_path,
+        destination,
+        checkpoint_contract,
+        _runtime_provenance(),
+        _implementation_provenance(),
+    )
+
+    assert conversion_calls == [
+        (
+            str(checkpoint_path),
+            str(destination),
+            {
+                "dtype": "bfloat16",
+                "safe_serialization": True,
+                "fuse_embedding_layer_norm": False,
+                "tokenizer_name_or_path": str(tokenizer_path.resolve()),
+                "source_revision": checkpoint_contract.revision,
+            },
+        )
+    ]
+    provenance = json.loads(
+        (destination / "rwkv7_source_provenance.json").read_text(encoding="utf-8")
+    )
+    assert provenance["tokenizer"] == {
+        "source_path": str(tokenizer_path.resolve()),
+        "artifact_manifest": _artifact_file_manifest(tokenizer_path),
+    }
+
+
+@pytest.mark.unit
+def test_formal_runner_keeps_results_for_two_candidates_in_one_output_root(
+    tmp_path, monkeypatch
+):
+    import transformers
+
+    output_dir = tmp_path / "formal-output"
+    tokenizer_path = tmp_path / "standard-fast-tokenizer"
+    tokenizer_path.mkdir()
+    (tokenizer_path / "tokenizer.json").write_text("{}\n", encoding="utf-8")
+    checkpoint_contract = RWKV7CheckpointContract()
+    runtime_provenance = _runtime_provenance()
+    implementation_revision = "f" * 40
+
+    monkeypatch.setattr(
+        rwkv7_module,
+        "validate_rwkv7_transformers_provenance",
+        lambda: runtime_provenance,
+    )
+    monkeypatch.setattr(
+        rwkv7_module,
+        "validate_rwkv7_implementation_provenance",
+        lambda revision: _implementation_provenance(revision),
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (12, 0))
+    monkeypatch.setattr(
+        rwkv7_module,
+        "verify_rwkv7_checkpoint",
+        lambda path: checkpoint_contract,
+    )
+    monkeypatch.setattr(
+        rwkv7_module,
+        "_prepare_standard_rwkv7_checkpoint",
+        lambda *args: {
+            "files": [
+                {
+                    "path": "model.safetensors",
+                    "size_bytes": 1,
+                    "sha256": "0" * 64,
+                }
+            ],
+            "file_count": 1,
+            "size_bytes": 1,
+            "sha256": "1" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        transformers.AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: SimpleNamespace(vocab_size=32),
+    )
+    monkeypatch.setattr(
+        rwkv7_module,
+        "_load_calibration_records",
+        lambda *args, **kwargs: (
+            [
+                {
+                    "input_ids": torch.tensor([[1, 2]], dtype=torch.long),
+                    "attention_mask": torch.ones((1, 2), dtype=torch.long),
+                }
+            ],
+            {"sha256": "2" * 64},
+        ),
+    )
+
+    def quantize(*args, forced_candidate, **kwargs):
+        candidate_dir = Path(args[1]) / forced_candidate
+        candidate_dir.mkdir(parents=True, exist_ok=True)
+        (candidate_dir / "model.safetensors").write_bytes(
+            forced_candidate.encode("utf-8")
+        )
+        return object(), {
+            "candidate": forced_candidate,
+            "artifact_contract": {
+                "runtime_provenance": runtime_provenance.model_dump(mode="json")
+            },
+        }
+
+    monkeypatch.setattr(rwkv7_module, "quantize_rwkv7_oneshot", quantize)
+
+    candidates = ("nvfp4-w4a4", "nvfp4-w4a16")
+    for candidate in candidates:
+        run_rwkv7_checkpoint_candidate(
+            tmp_path / checkpoint_contract.filename,
+            tmp_path / "calibration.jsonl",
+            output_dir,
+            tokenizer_path=tokenizer_path,
+            calibration_sha256="2" * 64,
+            implementation_revision=implementation_revision,
+            candidate=candidate,
+        )
+
+    result_paths = [
+        output_dir / "candidates" / candidate / "rwkv7_candidate_result.json"
+        for candidate in candidates
+    ]
+    assert all(path.is_file() for path in result_paths)
+    assert not (output_dir / "rwkv7_candidate_result.json").exists()
+    results = [json.loads(path.read_text(encoding="utf-8")) for path in result_paths]
+    assert [result["candidate"] for result in results] == list(candidates)
+    assert all(
+        result["execution"]["candidate"] == candidate
+        for result, candidate in zip(results, candidates, strict=True)
+    )
+    assert all(
+        result["tokenizer"]["artifact_manifest"]["sha256"]
+        == _artifact_file_manifest(tokenizer_path)["sha256"]
+        for result in results
+    )
 
 
 @pytest.mark.unit

@@ -19,6 +19,7 @@ from llmcompressor.modifiers.quantization.rwkv7 import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--tokenizer-path", type=Path, required=True)
     parser.add_argument("--calibration-jsonl", type=Path, required=True)
     parser.add_argument("--calibration-sha256", required=True)
     parser.add_argument("--implementation-revision", required=True)
@@ -44,6 +45,7 @@ def main() -> None:
         args.checkpoint,
         args.calibration_jsonl,
         args.output_dir,
+        tokenizer_path=args.tokenizer_path,
         calibration_sha256=args.calibration_sha256,
         implementation_revision=args.implementation_revision,
         candidate=args.candidate,

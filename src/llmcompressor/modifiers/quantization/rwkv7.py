@@ -2682,6 +2682,19 @@ def _artifact_file_manifest(
     }
 
 
+def _rwkv7_tokenizer_provenance(tokenizer_path: Path) -> dict[str, Any]:
+    tokenizer_path = tokenizer_path.resolve()
+    if not tokenizer_path.is_dir() or not (tokenizer_path / "tokenizer.json").is_file():
+        raise ValueError(
+            "RWKV-7 formal candidate runner requires a local standard fast "
+            "tokenizer directory containing tokenizer.json"
+        )
+    return {
+        "source_path": str(tokenizer_path),
+        "artifact_manifest": _artifact_file_manifest(tokenizer_path),
+    }
+
+
 def _load_calibration_records(
     calibration_path: Path,
     *,
@@ -2743,6 +2756,7 @@ def _load_calibration_records(
 
 def _prepare_standard_rwkv7_checkpoint(
     checkpoint_path: Path,
+    tokenizer_path: Path,
     destination: Path,
     checkpoint_contract: RWKV7CheckpointContract,
     runtime_provenance: RWKV7TransformersProvenance,
@@ -2750,9 +2764,11 @@ def _prepare_standard_rwkv7_checkpoint(
 ) -> dict[str, Any]:
     provenance_path = destination / "rwkv7_source_provenance.json"
     provenance_name = provenance_path.name
+    tokenizer_provenance = _rwkv7_tokenizer_provenance(tokenizer_path)
     provenance_prefix = {
         "schema_version": 2,
         "checkpoint": checkpoint_contract.model_dump(mode="json"),
+        "tokenizer": tokenizer_provenance,
         "converter_runtime": runtime_provenance.model_dump(mode="json"),
         "implementation": implementation_provenance.model_dump(mode="json"),
     }
@@ -2785,6 +2801,8 @@ def _prepare_standard_rwkv7_checkpoint(
             dtype="bfloat16",
             safe_serialization=True,
             fuse_embedding_layer_norm=False,
+            tokenizer_name_or_path=str(tokenizer_path.resolve()),
+            source_revision=checkpoint_contract.revision,
         )
         expected_provenance = {
             **provenance_prefix,
@@ -2813,6 +2831,7 @@ def run_rwkv7_checkpoint_candidate(
     calibration_path: Path,
     output_dir: Path,
     *,
+    tokenizer_path: Path,
     calibration_sha256: str,
     implementation_revision: str,
     candidate: Literal[
@@ -2836,10 +2855,12 @@ def run_rwkv7_checkpoint_candidate(
         raise RuntimeError("formal RWKV-7 NVFP4 execution requires a Blackwell GPU")
 
     checkpoint_contract = verify_rwkv7_checkpoint(checkpoint_path)
+    tokenizer_provenance = _rwkv7_tokenizer_provenance(tokenizer_path)
     output_dir = output_dir.resolve()
     standard_checkpoint = output_dir / "baseline-standard-hf"
     standard_manifest = _prepare_standard_rwkv7_checkpoint(
         checkpoint_path.resolve(),
+        tokenizer_path.resolve(),
         standard_checkpoint,
         checkpoint_contract,
         runtime_provenance,
@@ -2892,16 +2913,20 @@ def run_rwkv7_checkpoint_candidate(
         "repository": RWKV7RepositoryContract().model_dump(mode="json"),
         "runtime_provenance": runtime_provenance.model_dump(mode="json"),
         "checkpoint": checkpoint_contract.model_dump(mode="json"),
+        "tokenizer": tokenizer_provenance,
         "standard_checkpoint": standard_manifest,
         "calibration": calibration,
         "candidate": candidate,
         "execution": execution,
-        "candidate_artifact": _artifact_file_manifest(candidate_dir),
+        "candidate_artifact": _artifact_file_manifest(
+            candidate_dir,
+            exclude={"rwkv7_candidate_result.json"},
+        ),
         "formal_checkpoint": True,
         "formal_evaluation": False,
         "diagnostic_tiny": False,
     }
-    _atomic_json(output_dir / "rwkv7_candidate_result.json", result)
+    _atomic_json(candidate_dir / "rwkv7_candidate_result.json", result)
     return result
 
 

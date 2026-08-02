@@ -338,7 +338,7 @@ def test_execution_rejects_invalid_fresh_process_boundary(tmp_path, kwargs, mess
 )
 @pytest.mark.parametrize("candidate", ["nvfp4-w4a4", "nvfp4-w4a16"])
 @pytest.mark.integration
-def test_gb10_real_nvfp4_checkpoint_has_packed_tensors_and_forward(
+def test_blackwell_tiny_nvfp4_artifact_has_packed_tensors_and_forward(
     tmp_path, owned_process_tmpdir, candidate
 ):
     from tokenizers import Tokenizer
