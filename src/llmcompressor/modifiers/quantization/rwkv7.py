@@ -1,7 +1,13 @@
 """Conservative quantization targeting for standard Transformers RWKV-7."""
 
+import json
+import os
 import re
-from typing import Any, Literal
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any, Callable, Literal
 
 import torch
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -12,6 +18,8 @@ __all__ = [
     "RWKV7QuantizationRecipeMetadata",
     "apply_rwkv7_target_policy",
     "build_rwkv7_quantization_recipe",
+    "quantize_rwkv7_oneshot",
+    "audit_rwkv7_quantized_checkpoint",
 ]
 
 
@@ -203,6 +211,192 @@ def build_rwkv7_quantization_recipe(
         update={"recipe": recipe_metadata}
     )
     return modifier
+
+
+def audit_rwkv7_quantized_checkpoint(
+    output_dir: Path, expected_targets: list[str], candidate: str
+) -> dict[str, Any]:
+    """Verify compressed tensor storage, not merely serialized recipe metadata."""
+    from safetensors import safe_open
+
+    config = json.loads((output_dir / "config.json").read_text(encoding="utf-8"))
+    quantization = config.get("quantization_config", {})
+    expected_format = "nvfp4-pack-quantized"
+    if (
+        quantization.get("quant_method") != "compressed-tensors"
+        or quantization.get("quantization_status") != "compressed"
+        or quantization.get("format") != expected_format
+    ):
+        raise RuntimeError("RWKV-7 checkpoint lacks compressed NVFP4 metadata")
+    tensors: dict[str, tuple[list[int], str]] = {}
+    for shard in sorted(output_dir.glob("*.safetensors")):
+        with safe_open(shard, framework="pt", device="cpu") as handle:
+            for name in handle.keys():
+                tensors[name] = (
+                    handle.get_slice(name).get_shape(),
+                    handle.get_slice(name).get_dtype(),
+                )
+    for target in expected_targets:
+        required = {
+            f"{target}.weight_packed",
+            f"{target}.weight_scale",
+            f"{target}.weight_global_scale",
+        }
+        if candidate == "nvfp4-w4a4":
+            required.add(f"{target}.input_global_scale")
+        missing = sorted(required - tensors.keys())
+        if missing or f"{target}.weight" in tensors:
+            raise RuntimeError(
+                "RWKV-7 target was not physically NVFP4-compressed: "
+                f"{target}; missing={missing}"
+            )
+        if (
+            tensors[f"{target}.weight_packed"][1] != "U8"
+            or tensors[f"{target}.weight_scale"][1] != "F8_E4M3"
+        ):
+            raise RuntimeError(
+                f"RWKV-7 target has drifted packed/scale dtypes: {target}"
+            )
+    protected = [name for name in tensors if (".att." in name or name == "head.weight")]
+    if any(
+        name.endswith(("weight_packed", "weight_scale", "weight_global_scale"))
+        for name in protected
+    ):
+        raise RuntimeError("RWKV-7 protected TimeMix/head tensors were compressed")
+    return {
+        "format": expected_format,
+        "targets": expected_targets,
+        "protected_tensor_count": len(protected),
+        "tensor_count": len(tensors),
+    }
+
+
+def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}."
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, path)
+    finally:
+        Path(temporary_name).unlink(missing_ok=True)
+
+
+def quantize_rwkv7_oneshot(
+    model_factory: Callable[[], torch.nn.Module],
+    output_dir: Path,
+    *,
+    calibration_dataset: object | None,
+    processor: object | None,
+    candidates: tuple[str, ...] = ("nvfp4-w4a4", "nvfp4-w4a16"),
+) -> tuple[torch.nn.Module, dict[str, Any]]:
+    """Execute the closed candidate order through standard ``oneshot``."""
+    from llmcompressor import oneshot
+
+    if candidates != tuple(_CANDIDATE_SCHEMES):
+        raise ValueError(
+            "RWKV-7 quantization execution requires the closed candidate order"
+        )
+    failures = []
+    for candidate in candidates:
+        model = model_factory()
+        modifier = build_rwkv7_quantization_recipe(model, candidate)
+        destination = output_dir / candidate
+        destination.mkdir(parents=True, exist_ok=True)
+        try:
+            result = oneshot(
+                model=model,
+                dataset=calibration_dataset if candidate == "nvfp4-w4a4" else None,
+                processor=processor if candidate == "nvfp4-w4a4" else None,
+                recipe=modifier,
+                pipeline="basic" if candidate == "nvfp4-w4a4" else "datafree",
+                output_dir=None,
+            )
+            base_model = result.base_model
+            first_channel_mix = base_model.blocks[0].ffn
+            reference = next(result.parameters())
+            with torch.inference_mode():
+                cell_output, cell_state = first_channel_mix(
+                    torch.randn(
+                        1,
+                        4,
+                        result.config.hidden_size,
+                        device=reference.device,
+                        dtype=reference.dtype,
+                    ),
+                    torch.zeros(
+                        1,
+                        result.config.hidden_size,
+                        device=reference.device,
+                        dtype=reference.dtype,
+                    ),
+                )
+            if (
+                not torch.isfinite(cell_output).all()
+                or not torch.isfinite(cell_state).all()
+            ):
+                raise RuntimeError(
+                    "quantized RWKV-7 ChannelMix cell produced non-finite output"
+                )
+            result.save_pretrained(destination, save_compressed=True)
+            if processor is not None and hasattr(processor, "save_pretrained"):
+                processor.save_pretrained(destination)
+            audit = audit_rwkv7_quantized_checkpoint(
+                destination, modifier.target_policy_metadata.selection.names, candidate
+            )
+        except Exception as error:
+            failures.append(
+                {
+                    "candidate": candidate,
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                }
+            )
+            continue
+        reload_script = """
+import sys, torch
+from transformers import AutoModelForCausalLM
+model = AutoModelForCausalLM.from_pretrained(sys.argv[1], device_map='cuda').eval()
+with torch.inference_mode():
+    logits = model(torch.tensor([[1, 2, 3, 4]], device='cuda')).logits
+assert torch.isfinite(logits).all()
+"""
+        reload_environment = dict(os.environ)
+        reload_temporary = destination / ".fresh-reload-tmp"
+        reload_temporary.mkdir(exist_ok=True)
+        reload_environment["TMPDIR"] = str(reload_temporary)
+        reload_run = subprocess.run(
+            [sys.executable, "-c", reload_script, str(destination)],
+            capture_output=True,
+            text=True,
+            env=reload_environment,
+        )
+        metadata = {
+            "schema_version": 1,
+            "candidate": candidate,
+            "candidate_order": list(candidates),
+            "quantization_applied": True,
+            "audit": audit,
+            "cell_forward": {
+                "passed": True,
+                "output_shape": list(cell_output.shape),
+                "state_shape": list(cell_state.shape),
+            },
+            "fresh_reload": {
+                "passed": reload_run.returncode == 0,
+                "returncode": reload_run.returncode,
+                "stderr": reload_run.stderr[-8000:],
+            },
+            "failures": failures,
+        }
+        _atomic_json(destination / "rwkv7_quantization_execution.json", metadata)
+        return result, metadata
+    raise RuntimeError(f"all RWKV-7 quantization candidates failed: {failures}")
 
 
 def _get_rwkv7_model_types() -> tuple[type, type[torch.nn.Module]]:
