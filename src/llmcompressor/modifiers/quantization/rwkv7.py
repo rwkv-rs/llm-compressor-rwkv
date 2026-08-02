@@ -52,6 +52,9 @@ _CANDIDATE_SCHEMES = {
     "nvfp4-w4a4": "NVFP4",
     "nvfp4-w4a16": "NVFP4A16",
 }
+_FRESH_RELOAD_GENERATE_SEED = 20260801
+_FRESH_RELOAD_PROMPT_IDS = [1, 2, 3, 4]
+_FRESH_RELOAD_NEW_TOKENS = 4
 
 
 class RWKV7QuantizationRecipeMetadata(BaseModel):
@@ -384,6 +387,9 @@ from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.utils.quantization_config import CompressedTensorsConfig
 
 config = AutoConfig.from_pretrained(sys.argv[1])
+generate_seed = int(sys.argv[2])
+prompt_ids = json.loads(sys.argv[3])
+max_new_tokens = int(sys.argv[4])
 runtime_dtype = config.dtype
 assert isinstance(runtime_dtype, torch.dtype)
 model = AutoModelForCausalLM.from_pretrained(
@@ -416,14 +422,36 @@ assert all(
 assert all(module.weight.dtype == runtime_dtype for module in quantized)
 assert all(getattr(module, 'quantization_scheme', None) is None for module in protected)
 assert all(module.weight.dtype == runtime_dtype for module in protected)
+prompt = torch.tensor([prompt_ids], device='cuda')
+torch.manual_seed(generate_seed)
 with torch.inference_mode():
-    logits = model(torch.tensor([[1, 2, 3, 4]], device='cuda')).logits
+    logits = model(prompt).logits
+    generated = model.generate(
+        prompt,
+        max_new_tokens=max_new_tokens,
+        do_sample=True,
+        temperature=0.8,
+        top_k=8,
+        use_cache=True,
+        pad_token_id=0,
+        eos_token_id=[],
+    )
 assert torch.isfinite(logits).all()
+assert generated.shape == (1, len(prompt_ids) + max_new_tokens)
+assert generated[0, :len(prompt_ids)].tolist() == prompt_ids
 print(json.dumps({
     'dtype': str(runtime_dtype),
     'logits_dtype': str(logits.dtype),
     'quantized_module_count': len(quantized),
     'protected_module_count': len(protected),
+    'standard_generate': {
+        'passed': True,
+        'use_cache': True,
+        'seed': generate_seed,
+        'prompt_ids': prompt_ids,
+        'max_new_tokens': max_new_tokens,
+        'generated_ids': generated.tolist(),
+    },
 }))
 """
         reload_environment = dict(os.environ)
@@ -431,7 +459,15 @@ print(json.dumps({
         reload_temporary.mkdir(exist_ok=True)
         reload_environment["TMPDIR"] = str(reload_temporary)
         reload_run = subprocess.run(
-            [sys.executable, "-c", reload_script, str(destination)],
+            [
+                sys.executable,
+                "-c",
+                reload_script,
+                str(destination),
+                str(_FRESH_RELOAD_GENERATE_SEED),
+                json.dumps(_FRESH_RELOAD_PROMPT_IDS),
+                str(_FRESH_RELOAD_NEW_TOKENS),
+            ],
             capture_output=True,
             text=True,
             env=reload_environment,
@@ -459,7 +495,9 @@ print(json.dumps({
                 "source_owner": "Transformers RWKV7 loader",
                 "regression_expectation": (
                     "the standard compressed-tensors dequantization path must restore "
-                    "packed Linear weights at the checkpoint dtype before forward"
+                    "packed Linear weights at the checkpoint dtype before forward, "
+                    "and standard generate(use_cache=True) must propagate recurrent "
+                    "state through decode"
                 ),
             },
             "failures": failures,

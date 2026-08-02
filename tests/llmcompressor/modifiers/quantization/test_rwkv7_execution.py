@@ -132,9 +132,21 @@ def test_gb10_real_nvfp4_checkpoint_has_packed_tensors_and_forward(
         "standard compressed-tensors dequantization path"
         in metadata["fresh_reload"]["regression_expectation"]
     )
-    assert metadata["fresh_reload"]["evidence"] == {
-        "dtype": "torch.bfloat16",
-        "logits_dtype": "torch.bfloat16",
-        "quantized_module_count": 4,
-        "protected_module_count": 9,
+    reload_evidence = metadata["fresh_reload"]["evidence"]
+    assert reload_evidence["dtype"] == "torch.bfloat16"
+    assert reload_evidence["logits_dtype"] == "torch.bfloat16"
+    assert reload_evidence["quantized_module_count"] == 4
+    assert reload_evidence["protected_module_count"] == 9
+    generate_evidence = reload_evidence["standard_generate"]
+    assert {
+        key: value for key, value in generate_evidence.items() if key != "generated_ids"
+    } == {
+        "passed": True,
+        "use_cache": True,
+        "seed": 20260801,
+        "prompt_ids": [1, 2, 3, 4],
+        "max_new_tokens": 4,
     }
+    assert len(generate_evidence["generated_ids"]) == 1
+    assert generate_evidence["generated_ids"][0][:4] == [1, 2, 3, 4]
+    assert len(generate_evidence["generated_ids"][0]) == 8
