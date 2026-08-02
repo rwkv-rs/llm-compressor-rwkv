@@ -238,6 +238,16 @@ class RWKV7ArtifactContract(BaseModel):
     formal_checkpoint: bool
     formal_evaluation: Literal[False] = False
 
+    @model_validator(mode="after")
+    def validate_applied_quantization(self) -> RWKV7ArtifactContract:
+        recipe = self.target_policy.recipe
+        if recipe is None or not recipe.quantization_applied:
+            raise ValueError(
+                "RWKV-7 compressed artifact metadata must record applied "
+                "quantization"
+            )
+        return self
+
 
 class RWKV7QuantizationRecipeMetadata(BaseModel):
     """Loader-facing contract for one closed RWKV-7 quantization candidate."""
@@ -267,7 +277,7 @@ class RWKV7QuantizationRecipeMetadata(BaseModel):
     low_rank_weight_dtype: Literal["none", "int8"]
     targets: list[str]
     framework_versions: dict[str, str]
-    quantization_applied: Literal[False] = False
+    quantization_applied: bool = False
 
     @model_validator(mode="after")
     def validate_closed_contract(self):
@@ -329,6 +339,13 @@ def build_rwkv7_artifact_contract(
         raise ValueError(
             "RWKV-7 artifact candidate must match resolved recipe metadata"
         )
+    artifact_target_policy = target_policy.model_copy(
+        update={
+            "recipe": target_policy.recipe.model_copy(
+                update={"quantization_applied": True}
+            )
+        }
+    )
     protected_modules = [
         name
         for decision in target_policy.protections
@@ -375,7 +392,7 @@ def build_rwkv7_artifact_contract(
         repository=RWKV7RepositoryContract(),
         checkpoint=checkpoint,
         candidate=candidate,
-        target_policy=target_policy,
+        target_policy=artifact_target_policy,
         vllm=RWKV7VLLMLoaderMetadata(
             quantization_format=(
                 "pack-quantized"
@@ -556,10 +573,14 @@ def audit_rwkv7_quantized_checkpoint(
     config = json.loads((output_dir / "config.json").read_text(encoding="utf-8"))
     quantization = config.get("quantization_config", {})
     serialized_contract = config.get(_RWKV7_METADATA_KEY)
-    if artifact_contract is not None:
+    try:
         loaded_contract = RWKV7ArtifactContract.model_validate(serialized_contract)
-        if loaded_contract != artifact_contract:
-            raise RuntimeError("RWKV-7 serialized artifact contract drifted")
+    except ValueError as error:
+        raise RuntimeError(
+            "RWKV-7 serialized compressed artifact metadata is invalid"
+        ) from error
+    if artifact_contract is not None and loaded_contract != artifact_contract:
+        raise RuntimeError("RWKV-7 serialized artifact contract drifted")
     expected_format = (
         "pack-quantized"
         if candidate == "w8a16-low-rank-critical-high"
@@ -890,11 +911,6 @@ def quantize_rwkv7_oneshot(
     for candidate in execution_candidates:
         model = model_factory()
         modifier = build_rwkv7_quantization_recipe(model, candidate)
-        artifact_contract = build_rwkv7_artifact_contract(
-            modifier.target_policy_metadata,
-            candidate,
-            checkpoint=checkpoint_contract,
-        )
         destination = output_dir / candidate
         destination.mkdir(parents=True, exist_ok=True)
         try:
@@ -909,6 +925,11 @@ def quantize_rwkv7_oneshot(
                 recipe=modifier,
                 pipeline="basic" if candidate == "nvfp4-w4a4" else "datafree",
                 output_dir=None,
+            )
+            artifact_contract = build_rwkv7_artifact_contract(
+                modifier.target_policy_metadata,
+                candidate,
+                checkpoint=checkpoint_contract,
             )
             if torch.cuda.is_available():
                 torch.cuda.synchronize()

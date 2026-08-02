@@ -10,6 +10,7 @@ import torch
 
 from llmcompressor.core import Event, EventType, State
 from llmcompressor.modifiers.quantization.rwkv7 import (
+    RWKV7ArtifactContract,
     RWKV7CheckpointContract,
     _fresh_reload_generate_script,
     _load_calibration_records,
@@ -125,6 +126,7 @@ print(json.dumps({{
 @pytest.mark.unit
 def test_artifact_contract_pins_fork_standard_names_and_v_first_protection():
     modifier = build_rwkv7_quantization_recipe(_tiny_standard_rwkv7())
+    assert modifier.target_policy_metadata.recipe.quantization_applied is False
 
     contract = build_rwkv7_artifact_contract(
         modifier.target_policy_metadata,
@@ -159,6 +161,7 @@ def test_artifact_contract_pins_fork_standard_names_and_v_first_protection():
     ]
     assert contract.formal_checkpoint is True
     assert contract.formal_evaluation is False
+    assert contract.target_policy.recipe.quantization_applied is True
 
 
 @pytest.fixture
@@ -257,6 +260,15 @@ def standard_linear_w8_artifact(tmp_path):
     assert audit["quantized_weight_names"] == contract.vllm.quantized_weight_names
     assert audit["legacy_weight_aliases"] == []
     assert not (tmp_path / "rwkv7_low_rank_w8.safetensors").exists()
+    serialized_config = json.loads(
+        (tmp_path / "config.json").read_text(encoding="utf-8")
+    )
+    assert serialized_config["quantization_config"]["quantization_status"] == (
+        "compressed"
+    )
+    assert serialized_config["rwkv7_quantization_metadata"]["target_policy"][
+        "recipe"
+    ]["quantization_applied"] is True
 
     return tmp_path, contract, audit
 
@@ -272,6 +284,34 @@ def test_low_rank_w8_uses_standard_linear_serialization_and_audit(
     assert len(contract.vllm.quantized_low_rank_modules) == 12
     assert audit["standard_linear_ownership"] is True
     assert audit["legacy_weight_aliases"] == []
+
+
+@pytest.mark.integration
+def test_compressed_artifact_rejects_unapplied_recipe_metadata(
+    standard_linear_w8_artifact,
+):
+    artifact_path, contract, _ = standard_linear_w8_artifact
+    config_path = artifact_path / "config.json"
+    serialized_config = json.loads(config_path.read_text(encoding="utf-8"))
+    serialized_contract = serialized_config["rwkv7_quantization_metadata"]
+    serialized_contract["target_policy"]["recipe"][
+        "quantization_applied"
+    ] = False
+
+    with pytest.raises(ValueError, match="must record applied quantization"):
+        RWKV7ArtifactContract.model_validate(serialized_contract)
+
+    config_path.write_text(
+        json.dumps(serialized_config, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="artifact metadata is invalid"):
+        audit_rwkv7_quantized_checkpoint(
+            artifact_path,
+            contract.vllm.quantized_modules,
+            "w8a16-low-rank-critical-high",
+            contract,
+        )
 
 
 @pytest.mark.integration
