@@ -494,6 +494,97 @@ def test_rwkv7_implementation_provenance_binds_clean_editable_checkout(
 
 
 @pytest.mark.unit
+def test_rwkv7_implementation_provenance_accepts_exact_managed_export(
+    tmp_path, monkeypatch
+):
+    import llmcompressor
+
+    repository_root = tmp_path / "llm-compressor-rwkv"
+    module_path = repository_root / "src/llmcompressor/__init__.py"
+    module_path.parent.mkdir(parents=True)
+    module_path.write_text("", encoding="utf-8")
+    revision = "f" * 40
+
+    class _EditableDistribution:
+        metadata = {"Name": "llmcompressor"}
+
+        @staticmethod
+        def read_text(filename):
+            assert filename == "direct_url.json"
+            return json.dumps(
+                {
+                    "url": repository_root.as_uri(),
+                    "dir_info": {"editable": True},
+                }
+            )
+
+    monkeypatch.setattr(
+        rwkv7_module.importlib_metadata,
+        "distribution",
+        lambda name: _EditableDistribution(),
+    )
+    monkeypatch.setattr(llmcompressor, "__file__", str(module_path))
+    monkeypatch.setattr(
+        rwkv7_module,
+        "_git_provenance_value",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("gitless export")),
+    )
+    monkeypatch.setenv(
+        "LLMCOMPRESSOR_RWKV_REPOSITORY",
+        "https://github.com/rwkv-rs/llm-compressor-rwkv.git",
+    )
+    monkeypatch.setenv("LLMCOMPRESSOR_RWKV_REVISION", revision)
+
+    assert validate_rwkv7_implementation_provenance(revision) == (
+        _implementation_provenance(revision)
+    )
+    monkeypatch.setenv("LLMCOMPRESSOR_RWKV_REVISION", "e" * 40)
+    with pytest.raises(RuntimeError, match="differs from the active checkout"):
+        validate_rwkv7_implementation_provenance(revision)
+
+
+@pytest.mark.unit
+def test_rwkv7_implementation_provenance_rejects_unbound_gitless_export(
+    tmp_path, monkeypatch
+):
+    import llmcompressor
+
+    repository_root = tmp_path / "llm-compressor-rwkv"
+    module_path = repository_root / "src/llmcompressor/__init__.py"
+    module_path.parent.mkdir(parents=True)
+    module_path.write_text("", encoding="utf-8")
+
+    class _EditableDistribution:
+        metadata = {"Name": "llmcompressor"}
+
+        @staticmethod
+        def read_text(filename):
+            return json.dumps(
+                {
+                    "url": repository_root.as_uri(),
+                    "dir_info": {"editable": True},
+                }
+            )
+
+    monkeypatch.setattr(
+        rwkv7_module.importlib_metadata,
+        "distribution",
+        lambda name: _EditableDistribution(),
+    )
+    monkeypatch.setattr(llmcompressor, "__file__", str(module_path))
+    monkeypatch.setattr(
+        rwkv7_module,
+        "_git_provenance_value",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("gitless export")),
+    )
+    monkeypatch.delenv("LLMCOMPRESSOR_RWKV_REPOSITORY", raising=False)
+    monkeypatch.delenv("LLMCOMPRESSOR_RWKV_REVISION", raising=False)
+
+    with pytest.raises(RuntimeError, match="gitless managed exports require exact"):
+        validate_rwkv7_implementation_provenance("f" * 40)
+
+
+@pytest.mark.unit
 def test_formal_runner_fails_provenance_before_output_mutation(tmp_path, monkeypatch):
     output_dir = tmp_path / "result"
     monkeypatch.setattr(

@@ -579,27 +579,37 @@ def validate_rwkv7_implementation_provenance(
         raise RuntimeError(
             f"{requirement}; imported module does not belong to the editable source"
         )
-    repository_top_level = Path(
-        _git_provenance_value(repository_root, "rev-parse", "--show-toplevel")
-    ).resolve()
-    if repository_top_level != repository_root:
-        raise RuntimeError(f"{requirement}; editable source is not the Git root")
-    repository = _git_provenance_value(
-        repository_root,
-        "remote",
-        "get-url",
-        "origin",
-    )
-    revision = _git_provenance_value(repository_root, "rev-parse", "HEAD")
-    dirty = subprocess.run(
-        ["git", "-C", str(repository_root), "status", "--porcelain"],
-        capture_output=True,
-        text=True,
-    )
-    if dirty.returncode != 0:
-        raise RuntimeError(f"{requirement}; Git status could not be read")
-    if dirty.stdout.strip():
-        raise RuntimeError(f"{requirement}; editable source is dirty")
+    try:
+        repository_top_level = Path(
+            _git_provenance_value(repository_root, "rev-parse", "--show-toplevel")
+        ).resolve()
+    except RuntimeError as git_error:
+        repository = os.environ.get("LLMCOMPRESSOR_RWKV_REPOSITORY", "")
+        revision = os.environ.get("LLMCOMPRESSOR_RWKV_REVISION", "")
+        if not repository or re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+            raise RuntimeError(
+                f"{requirement}; gitless managed exports require exact repository "
+                "and revision provenance"
+            ) from git_error
+    else:
+        if repository_top_level != repository_root:
+            raise RuntimeError(f"{requirement}; editable source is not the Git root")
+        repository = _git_provenance_value(
+            repository_root,
+            "remote",
+            "get-url",
+            "origin",
+        )
+        revision = _git_provenance_value(repository_root, "rev-parse", "HEAD")
+        dirty = subprocess.run(
+            ["git", "-C", str(repository_root), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+        )
+        if dirty.returncode != 0:
+            raise RuntimeError(f"{requirement}; Git status could not be read")
+        if dirty.stdout.strip():
+            raise RuntimeError(f"{requirement}; editable source is dirty")
     if _canonical_repository_url(repository) != _canonical_repository_url(
         expected.fork_repository
     ):
