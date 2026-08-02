@@ -8,7 +8,10 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
-from llmcompressor.modifiers.quantization.rwkv7 import quantize_rwkv7_oneshot
+from llmcompressor.modifiers.quantization.rwkv7 import (
+    RWKV7CheckpointContract,
+    quantize_rwkv7_oneshot,
+)
 
 
 @pytest.fixture
@@ -74,6 +77,43 @@ def test_execution_falls_back_only_in_closed_order(tmp_path, monkeypatch):
     assert metadata["failures"][0]["error"] == "W4A4 unavailable"
 
 
+@pytest.mark.unit
+def test_formal_execution_rejects_a_failed_fresh_process_reload(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("llmcompressor.oneshot", lambda *, model, **kwargs: model)
+    monkeypatch.setattr(
+        "llmcompressor.modifiers.quantization.rwkv7.audit_rwkv7_quantized_checkpoint",
+        lambda *args: {"format": "nvfp4-pack-quantized"},
+    )
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1, stderr="fresh process could not load"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="fresh_reload_generate"):
+        quantize_rwkv7_oneshot(
+            lambda: _model("cpu"),
+            tmp_path,
+            calibration_dataset=None,
+            processor=None,
+            forced_candidate="nvfp4-w4a16",
+            checkpoint_contract=RWKV7CheckpointContract(),
+        )
+
+    evidence = json.loads(
+        (
+            tmp_path
+            / "nvfp4-w4a16"
+            / "rwkv7_quantization_execution.json"
+        ).read_text()
+    )
+    assert evidence["fresh_reload"]["passed"] is False
+    assert evidence["failures"][-1]["stage"] == "fresh_reload_generate"
+
+
 @pytest.mark.skipif(
     os.environ.get("LLMCOMPRESSOR_RWKV7_GPU_TEST") != "1"
     or not torch.cuda.is_available()
@@ -114,6 +154,7 @@ def test_gb10_real_nvfp4_checkpoint_has_packed_tensors_and_forward(
     assert metadata["forced_candidate"] == candidate
     assert metadata["quantization_applied"] is True
     assert metadata["audit"]["format"] == "nvfp4-pack-quantized"
+    assert metadata["audit"]["artifact_contract_serialized"] is True
     assert len(metadata["audit"]["targets"]) == 4
     assert metadata["audit"]["input_quantized"] is (candidate == "nvfp4-w4a4")
     assert metadata["cell_forward"] == {
@@ -137,6 +178,16 @@ def test_gb10_real_nvfp4_checkpoint_has_packed_tensors_and_forward(
     assert reload_evidence["logits_dtype"] == "torch.bfloat16"
     assert reload_evidence["quantized_module_count"] == 4
     assert reload_evidence["protected_module_count"] == 9
+    assert reload_evidence["protected_tensor_count"] == 37
+    assert reload_evidence["artifact_contract_validated"] is True
+    artifact_contract = metadata["artifact_contract"]
+    assert artifact_contract["formal_checkpoint"] is False
+    assert artifact_contract["formal_evaluation"] is False
+    assert artifact_contract["vllm"]["source_format"] == "standard_hf"
+    assert artifact_contract["vllm"]["legacy_pth_direct_load"] is False
+    assert "model.blocks.0.att.value" in artifact_contract["vllm"][
+        "protected_modules"
+    ]
     generate_evidence = reload_evidence["standard_generate"]
     assert {
         key: value for key, value in generate_evidence.items() if key != "generated_ids"

@@ -1,5 +1,8 @@
 """Conservative quantization targeting for standard Transformers RWKV-7."""
 
+from __future__ import annotations
+
+import hashlib
 import json
 import os
 import re
@@ -15,11 +18,17 @@ from pydantic import BaseModel, ConfigDict, model_validator
 __all__ = [
     "QuantizationTargetPolicyDecision",
     "QuantizationTargetPolicyMetadata",
+    "RWKV7ArtifactContract",
+    "RWKV7CheckpointContract",
     "RWKV7QuantizationRecipeMetadata",
+    "RWKV7RepositoryContract",
     "apply_rwkv7_target_policy",
+    "build_rwkv7_artifact_contract",
     "build_rwkv7_quantization_recipe",
     "quantize_rwkv7_oneshot",
     "audit_rwkv7_quantized_checkpoint",
+    "run_rwkv7_checkpoint_candidate",
+    "verify_rwkv7_checkpoint",
 ]
 
 
@@ -55,6 +64,104 @@ _CANDIDATE_SCHEMES = {
 _FRESH_RELOAD_GENERATE_SEED = 20260801
 _FRESH_RELOAD_PROMPT_IDS = [1, 2, 3, 4]
 _FRESH_RELOAD_NEW_TOKENS = 4
+_RWKV7_METADATA_KEY = "rwkv7_quantization_metadata"
+_LLM_COMPRESSOR_UPSTREAM_REPOSITORY = (
+    "https://github.com/vllm-project/llm-compressor.git"
+)
+_LLM_COMPRESSOR_UPSTREAM_OID = "28c9c76b74cdd47076f95d012227482d22a8f365"
+_LLM_COMPRESSOR_FORK_REPOSITORY = (
+    "https://github.com/rwkv-rs/llm-compressor-rwkv.git"
+)
+_G1H_1_5B_CHECKPOINT = {
+    "model_id": "g1h-1.5b",
+    "repository": "BlinkDL/rwkv7-g1",
+    "revision": "6d5762253b343eec6cfbf5ed62f872f30a4cd89c",
+    "filename": "rwkv7-g1h-1.5b-20260710-ctx10240.pth",
+    "sha256": "737079d81865801fd85e5459488d89a36d5304a524e890244eb83d44f531c89c",
+    "size_bytes": 3055444605,
+}
+
+
+class RWKV7RepositoryContract(BaseModel):
+    """Immutable source/fork identity for this RWKV-7 adaptation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    upstream_repository: Literal[
+        "https://github.com/vllm-project/llm-compressor.git"
+    ] = _LLM_COMPRESSOR_UPSTREAM_REPOSITORY
+    upstream_oid: Literal[
+        "28c9c76b74cdd47076f95d012227482d22a8f365"
+    ] = _LLM_COMPRESSOR_UPSTREAM_OID
+    fork_repository: Literal[
+        "https://github.com/rwkv-rs/llm-compressor-rwkv.git"
+    ] = _LLM_COMPRESSOR_FORK_REPOSITORY
+
+
+class RWKV7CheckpointContract(BaseModel):
+    """Pinned real 1.5B source checkpoint and standard conversion contract."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_id: Literal["g1h-1.5b"] = _G1H_1_5B_CHECKPOINT["model_id"]
+    repository: Literal["BlinkDL/rwkv7-g1"] = _G1H_1_5B_CHECKPOINT["repository"]
+    revision: Literal[
+        "6d5762253b343eec6cfbf5ed62f872f30a4cd89c"
+    ] = _G1H_1_5B_CHECKPOINT["revision"]
+    filename: Literal[
+        "rwkv7-g1h-1.5b-20260710-ctx10240.pth"
+    ] = _G1H_1_5B_CHECKPOINT["filename"]
+    sha256: Literal[
+        "737079d81865801fd85e5459488d89a36d5304a524e890244eb83d44f531c89c"
+    ] = _G1H_1_5B_CHECKPOINT["sha256"]
+    size_bytes: Literal[3055444605] = _G1H_1_5B_CHECKPOINT["size_bytes"]
+    source_format: Literal["legacy_pth"] = "legacy_pth"
+    converted_format: Literal["standard_hf_safetensors"] = (
+        "standard_hf_safetensors"
+    )
+    architecture: Literal["Rwkv7ForCausalLM"] = "Rwkv7ForCausalLM"
+    model_type: Literal["rwkv7"] = "rwkv7"
+    embedding_layer_norm_fused: Literal[False] = False
+
+
+class RWKV7VLLMLoaderMetadata(BaseModel):
+    """Metadata consumed by the standard-HF vLLM-RWKV loader boundary."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    architecture: Literal["Rwkv7ForCausalLM"] = "Rwkv7ForCausalLM"
+    model_type: Literal["rwkv7"] = "rwkv7"
+    source_format: Literal["standard_hf"] = "standard_hf"
+    load_format: Literal["safetensors"] = "safetensors"
+    quant_method: Literal["compressed-tensors"] = "compressed-tensors"
+    quantization_format: Literal["nvfp4-pack-quantized"] = (
+        "nvfp4-pack-quantized"
+    )
+    embedding_name: Literal["model.embeddings.weight"] = (
+        "model.embeddings.weight"
+    )
+    block_prefix: Literal["model.blocks."] = "model.blocks."
+    output_norm_prefix: Literal["model.ln_out."] = "model.ln_out."
+    head_name: Literal["head.weight"] = "head.weight"
+    legacy_pth_direct_load: Literal[False] = False
+    quantized_modules: list[str]
+    protected_modules: list[str]
+    protected_tensors: list[str]
+
+
+class RWKV7ArtifactContract(BaseModel):
+    """Self-contained loader and protection contract serialized with a result."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = 1
+    repository: RWKV7RepositoryContract
+    checkpoint: RWKV7CheckpointContract | None
+    candidate: Literal["nvfp4-w4a4", "nvfp4-w4a16"]
+    target_policy: QuantizationTargetPolicyMetadata
+    vllm: RWKV7VLLMLoaderMetadata
+    formal_checkpoint: bool
+    formal_evaluation: Literal[False] = False
 
 
 class RWKV7QuantizationRecipeMetadata(BaseModel):
@@ -112,6 +219,53 @@ class QuantizationTargetPolicyMetadata(BaseModel):
     selection: QuantizationTargetPolicyDecision
     protections: list[QuantizationTargetPolicyDecision]
     recipe: RWKV7QuantizationRecipeMetadata | None = None
+
+
+def build_rwkv7_artifact_contract(
+    target_policy: QuantizationTargetPolicyMetadata,
+    candidate: str,
+    *,
+    checkpoint: RWKV7CheckpointContract | None = None,
+) -> RWKV7ArtifactContract:
+    """Resolve the exact standard-HF names protected at the runtime boundary."""
+
+    if candidate not in _CANDIDATE_SCHEMES:
+        raise ValueError(f"unsupported RWKV-7 candidate for artifact: {candidate}")
+    if target_policy.recipe is None or target_policy.recipe.candidate != candidate:
+        raise ValueError(
+            "RWKV-7 artifact candidate must match resolved recipe metadata"
+        )
+    protected_modules = [
+        name
+        for decision in target_policy.protections
+        if decision.kind == "module"
+        for name in decision.names
+    ]
+    protected_tensors = [
+        name
+        for decision in target_policy.protections
+        if decision.kind == "tensor"
+        for name in decision.names
+    ]
+    layer_zero_value = f"{target_policy.base_model_prefix}.blocks.0.att.value"
+    if layer_zero_value not in protected_modules:
+        raise ValueError(
+            "RWKV-7 artifact must protect the layer-0 v_first producer"
+        )
+    if any(name.startswith("rwkv7.") for name in target_policy.selection.names):
+        raise ValueError("RWKV-7 artifact contains non-standard module names")
+    return RWKV7ArtifactContract(
+        repository=RWKV7RepositoryContract(),
+        checkpoint=checkpoint,
+        candidate=candidate,
+        target_policy=target_policy,
+        vllm=RWKV7VLLMLoaderMetadata(
+            quantized_modules=list(target_policy.selection.names),
+            protected_modules=protected_modules,
+            protected_tensors=protected_tensors,
+        ),
+        formal_checkpoint=checkpoint is not None,
+    )
 
 
 def _installed_framework_versions() -> dict[str, str]:
@@ -217,13 +371,21 @@ def build_rwkv7_quantization_recipe(
 
 
 def audit_rwkv7_quantized_checkpoint(
-    output_dir: Path, expected_targets: list[str], candidate: str
+    output_dir: Path,
+    expected_targets: list[str],
+    candidate: str,
+    artifact_contract: RWKV7ArtifactContract | None = None,
 ) -> dict[str, Any]:
     """Verify compressed tensor storage, not merely serialized recipe metadata."""
     from safetensors import safe_open
 
     config = json.loads((output_dir / "config.json").read_text(encoding="utf-8"))
     quantization = config.get("quantization_config", {})
+    serialized_contract = config.get(_RWKV7_METADATA_KEY)
+    if artifact_contract is not None:
+        loaded_contract = RWKV7ArtifactContract.model_validate(serialized_contract)
+        if loaded_contract != artifact_contract:
+            raise RuntimeError("RWKV-7 serialized artifact contract drifted")
     expected_format = "nvfp4-pack-quantized"
     if (
         quantization.get("quant_method") != "compressed-tensors"
@@ -285,6 +447,7 @@ def audit_rwkv7_quantized_checkpoint(
         "protected_tensor_count": len(protected),
         "tensor_count": len(tensors),
         "input_quantized": input_quantized,
+        "artifact_contract_serialized": artifact_contract is not None,
     }
 
 
@@ -312,6 +475,9 @@ def quantize_rwkv7_oneshot(
     processor: object | None,
     candidates: tuple[str, ...] = ("nvfp4-w4a4", "nvfp4-w4a16"),
     forced_candidate: str | None = None,
+    checkpoint_contract: RWKV7CheckpointContract | None = None,
+    fresh_reload_prompt_ids: list[int] | None = None,
+    fresh_reload_new_tokens: int = _FRESH_RELOAD_NEW_TOKENS,
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
     """Execute the closed candidate order through standard ``oneshot``."""
     from llmcompressor import oneshot
@@ -322,6 +488,17 @@ def quantize_rwkv7_oneshot(
         )
     if forced_candidate is not None and forced_candidate not in _CANDIDATE_SCHEMES:
         raise ValueError(f"unsupported forced RWKV-7 candidate: {forced_candidate}")
+    prompt_ids = list(
+        _FRESH_RELOAD_PROMPT_IDS
+        if fresh_reload_prompt_ids is None
+        else fresh_reload_prompt_ids
+    )
+    if not prompt_ids or any(
+        not isinstance(token, int) or token < 0 for token in prompt_ids
+    ):
+        raise ValueError("fresh reload prompt IDs must be non-empty non-negative ints")
+    if fresh_reload_new_tokens < 1:
+        raise ValueError("fresh reload must generate at least one token")
     execution_candidates = (
         candidates if forced_candidate is None else (forced_candidate,)
     )
@@ -329,6 +506,11 @@ def quantize_rwkv7_oneshot(
     for candidate in execution_candidates:
         model = model_factory()
         modifier = build_rwkv7_quantization_recipe(model, candidate)
+        artifact_contract = build_rwkv7_artifact_contract(
+            modifier.target_policy_metadata,
+            candidate,
+            checkpoint=checkpoint_contract,
+        )
         destination = output_dir / candidate
         destination.mkdir(parents=True, exist_ok=True)
         try:
@@ -366,11 +548,19 @@ def quantize_rwkv7_oneshot(
                 raise RuntimeError(
                     "quantized RWKV-7 ChannelMix cell produced non-finite output"
                 )
+            setattr(
+                result.config,
+                _RWKV7_METADATA_KEY,
+                artifact_contract.model_dump(mode="json"),
+            )
             result.save_pretrained(destination, save_compressed=True)
             if processor is not None and hasattr(processor, "save_pretrained"):
                 processor.save_pretrained(destination)
             audit = audit_rwkv7_quantized_checkpoint(
-                destination, modifier.target_policy_metadata.selection.names, candidate
+                destination,
+                modifier.target_policy_metadata.selection.names,
+                candidate,
+                artifact_contract,
             )
         except Exception as error:
             failures.append(
@@ -392,6 +582,12 @@ prompt_ids = json.loads(sys.argv[3])
 max_new_tokens = int(sys.argv[4])
 runtime_dtype = config.dtype
 assert isinstance(runtime_dtype, torch.dtype)
+contract = getattr(config, 'rwkv7_quantization_metadata')
+assert contract['schema_version'] == 1
+assert contract['candidate'] in ('nvfp4-w4a4', 'nvfp4-w4a16')
+assert contract['vllm']['architecture'] == 'Rwkv7ForCausalLM'
+assert contract['vllm']['source_format'] == 'standard_hf'
+assert contract['vllm']['legacy_pth_direct_load'] is False
 model = AutoModelForCausalLM.from_pretrained(
     sys.argv[1],
     device_map='cuda',
@@ -399,22 +595,13 @@ model = AutoModelForCausalLM.from_pretrained(
     quantization_config=CompressedTensorsConfig(dequantize=True),
 ).to(dtype=runtime_dtype).eval()
 quantized = [
-    module
-    for block in model.model.blocks
-    for module in (block.ffn.key, block.ffn.value)
+    model.get_submodule(name) for name in contract['vllm']['quantized_modules']
 ]
 protected = [
-    model.head,
-    *[
-        module
-        for block in model.model.blocks
-        for module in (
-            block.att.receptance,
-            block.att.key,
-            block.att.value,
-            block.att.output,
-        )
-    ],
+    model.get_submodule(name) for name in contract['vllm']['protected_modules']
+]
+protected_tensors = [
+    model.get_parameter(name) for name in contract['vllm']['protected_tensors']
 ]
 assert all(
     getattr(module, 'quantization_scheme', None) is not None for module in quantized
@@ -422,6 +609,7 @@ assert all(
 assert all(module.weight.dtype == runtime_dtype for module in quantized)
 assert all(getattr(module, 'quantization_scheme', None) is None for module in protected)
 assert all(module.weight.dtype == runtime_dtype for module in protected)
+assert all(parameter.dtype == runtime_dtype for parameter in protected_tensors)
 prompt = torch.tensor([prompt_ids], device='cuda')
 torch.manual_seed(generate_seed)
 with torch.inference_mode():
@@ -444,6 +632,8 @@ print(json.dumps({
     'logits_dtype': str(logits.dtype),
     'quantized_module_count': len(quantized),
     'protected_module_count': len(protected),
+    'protected_tensor_count': len(protected_tensors),
+    'artifact_contract_validated': True,
     'standard_generate': {
         'passed': True,
         'use_cache': True,
@@ -465,8 +655,8 @@ print(json.dumps({
                 reload_script,
                 str(destination),
                 str(_FRESH_RELOAD_GENERATE_SEED),
-                json.dumps(_FRESH_RELOAD_PROMPT_IDS),
-                str(_FRESH_RELOAD_NEW_TOKENS),
+                json.dumps(prompt_ids),
+                str(fresh_reload_new_tokens),
             ],
             capture_output=True,
             text=True,
@@ -481,6 +671,7 @@ print(json.dumps({
             "candidate_order": list(candidates),
             "forced_candidate": forced_candidate,
             "quantization_applied": True,
+            "artifact_contract": artifact_contract.model_dump(mode="json"),
             "audit": audit,
             "cell_forward": {
                 "passed": True,
@@ -503,8 +694,263 @@ print(json.dumps({
             "failures": failures,
         }
         _atomic_json(destination / "rwkv7_quantization_execution.json", metadata)
+        if checkpoint_contract is not None and reload_run.returncode != 0:
+            failures.append(
+                {
+                    "candidate": candidate,
+                    "stage": "fresh_reload_generate",
+                    "error_type": "SubprocessError",
+                    "error": reload_run.stderr[-8000:],
+                }
+            )
+            _atomic_json(
+                destination / "rwkv7_quantization_execution.json", metadata
+            )
+            continue
         return result, metadata
     raise RuntimeError(f"all RWKV-7 quantization candidates failed: {failures}")
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_rwkv7_checkpoint(checkpoint_path: Path) -> RWKV7CheckpointContract:
+    """Fail closed unless ``checkpoint_path`` is the pinned real g1h 1.5B file."""
+
+    checkpoint_path = checkpoint_path.resolve()
+    contract = RWKV7CheckpointContract()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"RWKV-7 checkpoint does not exist: {checkpoint_path}")
+    if checkpoint_path.name != contract.filename:
+        raise ValueError(
+            "RWKV-7 formal candidate runner only accepts the pinned checkpoint: "
+            f"expected={contract.filename} actual={checkpoint_path.name}"
+        )
+    actual_size = checkpoint_path.stat().st_size
+    if actual_size != contract.size_bytes:
+        raise ValueError(
+            "RWKV-7 checkpoint size mismatch: "
+            f"expected={contract.size_bytes} actual={actual_size}"
+        )
+    actual_sha256 = _sha256_file(checkpoint_path)
+    if actual_sha256 != contract.sha256:
+        raise ValueError(
+            "RWKV-7 checkpoint SHA-256 mismatch: "
+            f"expected={contract.sha256} actual={actual_sha256}"
+        )
+    return contract
+
+
+def _artifact_file_manifest(directory: Path) -> dict[str, Any]:
+    files = []
+    for path in sorted(
+        candidate for candidate in directory.rglob("*") if candidate.is_file()
+    ):
+        files.append(
+            {
+                "path": path.relative_to(directory).as_posix(),
+                "size_bytes": path.stat().st_size,
+                "sha256": _sha256_file(path),
+            }
+        )
+    if not files:
+        raise RuntimeError(f"artifact directory is empty: {directory}")
+    encoded = json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
+    return {
+        "files": files,
+        "file_count": len(files),
+        "size_bytes": sum(item["size_bytes"] for item in files),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def _load_calibration_records(
+    calibration_path: Path,
+    *,
+    expected_sha256: str,
+    max_samples: int,
+    max_length: int,
+    vocab_size: int,
+) -> tuple[list[dict[str, torch.Tensor]], dict[str, Any]]:
+    calibration_path = calibration_path.resolve()
+    if not calibration_path.is_file():
+        raise FileNotFoundError(f"calibration JSONL does not exist: {calibration_path}")
+    actual_sha256 = _sha256_file(calibration_path)
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            "calibration SHA-256 mismatch: "
+            f"expected={expected_sha256} actual={actual_sha256}"
+        )
+    if max_samples < 1 or max_length < 1:
+        raise ValueError("calibration max_samples and max_length must be positive")
+
+    records = []
+    with calibration_path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            input_ids = payload.get("input_ids")
+            if (
+                not isinstance(input_ids, list)
+                or not input_ids
+                or any(
+                    not isinstance(token, int) or not 0 <= token < vocab_size
+                    for token in input_ids
+                )
+            ):
+                raise ValueError(
+                    f"calibration line {line_number} has invalid input_ids"
+                )
+            input_ids = input_ids[:max_length]
+            records.append(
+                {
+                    "input_ids": torch.tensor([input_ids], dtype=torch.long),
+                    "attention_mask": torch.ones((1, len(input_ids)), dtype=torch.long),
+                }
+            )
+            if len(records) == max_samples:
+                break
+    if not records:
+        raise ValueError("calibration JSONL contains no usable records")
+    return records, {
+        "path": str(calibration_path),
+        "sha256": actual_sha256,
+        "sample_count": len(records),
+        "max_samples": max_samples,
+        "max_length": max_length,
+        "format": "jsonl-input_ids-v1",
+    }
+
+
+def _prepare_standard_rwkv7_checkpoint(
+    checkpoint_path: Path,
+    destination: Path,
+    checkpoint_contract: RWKV7CheckpointContract,
+) -> dict[str, Any]:
+    provenance_path = destination / "rwkv7_source_provenance.json"
+    expected_provenance = checkpoint_contract.model_dump(mode="json")
+    if destination.exists() and any(destination.iterdir()):
+        if not provenance_path.is_file():
+            raise RuntimeError(
+                "standard checkpoint destination is non-empty without provenance"
+            )
+        actual_provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        if actual_provenance != expected_provenance:
+            raise RuntimeError("standard checkpoint provenance does not match source")
+    else:
+        destination.mkdir(parents=True, exist_ok=True)
+        from transformers.models.rwkv7.convert_rwkv7_checkpoint_to_hf import (
+            convert_rwkv7_checkpoint_to_hf_format,
+        )
+
+        convert_rwkv7_checkpoint_to_hf_format(
+            str(checkpoint_path),
+            str(destination),
+            dtype="bfloat16",
+            safe_serialization=True,
+            fuse_embedding_layer_norm=False,
+        )
+        _atomic_json(provenance_path, expected_provenance)
+
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(destination)
+    if (
+        config.model_type != checkpoint_contract.model_type
+        or config.architectures != [checkpoint_contract.architecture]
+        or bool(getattr(config, "embedding_layer_norm_fused", False))
+    ):
+        raise RuntimeError(
+            "converted checkpoint does not satisfy the standard RWKV-7 loader contract"
+        )
+    if not list(destination.glob("*.safetensors")):
+        raise RuntimeError("converted checkpoint has no safetensors weights")
+    return _artifact_file_manifest(destination)
+
+
+def run_rwkv7_checkpoint_candidate(
+    checkpoint_path: Path,
+    calibration_path: Path,
+    output_dir: Path,
+    *,
+    calibration_sha256: str,
+    implementation_revision: str,
+    candidate: Literal["nvfp4-w4a4", "nvfp4-w4a16"],
+    max_calibration_samples: int = 128,
+    max_calibration_length: int = 1024,
+) -> dict[str, Any]:
+    """Quantize the pinned 1.5B checkpoint and emit a traceable candidate artifact."""
+
+    if not re.fullmatch(r"[0-9a-f]{40}", implementation_revision):
+        raise ValueError("implementation_revision must be a full lowercase Git OID")
+    if candidate not in _CANDIDATE_SCHEMES:
+        raise ValueError(f"unsupported RWKV-7 candidate: {candidate}")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 12:
+        raise RuntimeError("formal RWKV-7 NVFP4 execution requires a Blackwell GPU")
+
+    checkpoint_contract = verify_rwkv7_checkpoint(checkpoint_path)
+    output_dir = output_dir.resolve()
+    standard_checkpoint = output_dir / "baseline-standard-hf"
+    standard_manifest = _prepare_standard_rwkv7_checkpoint(
+        checkpoint_path.resolve(), standard_checkpoint, checkpoint_contract
+    )
+
+    from torch.utils.data import DataLoader
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    config = AutoConfig.from_pretrained(standard_checkpoint)
+    records, calibration = _load_calibration_records(
+        calibration_path,
+        expected_sha256=calibration_sha256,
+        max_samples=max_calibration_samples,
+        max_length=max_calibration_length,
+        vocab_size=config.vocab_size,
+    )
+    calibration_loader = DataLoader(records, batch_size=None)
+
+    def model_factory():
+        model = AutoModelForCausalLM.from_pretrained(
+            standard_checkpoint,
+            dtype=torch.bfloat16,
+            device_map="cuda",
+        ).eval()
+        if model.config.model_type != "rwkv7":
+            raise RuntimeError("standard checkpoint loaded a non-RWKV-7 model")
+        return model
+
+    prompt_ids = records[0]["input_ids"][0, :16].tolist()
+    _, execution = quantize_rwkv7_oneshot(
+        model_factory,
+        output_dir / "candidates",
+        calibration_dataset=calibration_loader,
+        processor=None,
+        forced_candidate=candidate,
+        checkpoint_contract=checkpoint_contract,
+        fresh_reload_prompt_ids=prompt_ids,
+    )
+    candidate_dir = output_dir / "candidates" / candidate
+    result = {
+        "schema_version": 1,
+        "implementation_revision": implementation_revision,
+        "repository": RWKV7RepositoryContract().model_dump(mode="json"),
+        "checkpoint": checkpoint_contract.model_dump(mode="json"),
+        "standard_checkpoint": standard_manifest,
+        "calibration": calibration,
+        "candidate": candidate,
+        "execution": execution,
+        "candidate_artifact": _artifact_file_manifest(candidate_dir),
+        "formal_checkpoint": True,
+        "formal_evaluation": False,
+        "diagnostic_tiny": False,
+    }
+    _atomic_json(output_dir / "rwkv7_candidate_result.json", result)
+    return result
 
 
 def _get_rwkv7_model_types() -> tuple[type, type[torch.nn.Module]]:
