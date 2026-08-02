@@ -12,11 +12,13 @@ from llmcompressor.core import Event, EventType, State
 from llmcompressor.modifiers.quantization.rwkv7 import (
     RWKV7ArtifactContract,
     RWKV7CheckpointContract,
+    RWKV7TransformersProvenance,
     _fresh_reload_generate_script,
     _load_calibration_records,
     audit_rwkv7_quantized_checkpoint,
     build_rwkv7_artifact_contract,
     build_rwkv7_quantization_recipe,
+    validate_rwkv7_transformers_provenance,
     verify_rwkv7_checkpoint,
 )
 
@@ -38,10 +40,27 @@ def _tiny_standard_rwkv7():
 
 
 def _run_fresh_process_load(model_path, *, compressed: bool):
+    provenance_import = ""
+    provenance_check = "transformers_provenance_validated = False"
     quantization_import = ""
     quantization_argument = ""
     contract_checks = ""
     if compressed:
+        provenance_import = """
+from llmcompressor.modifiers.quantization.rwkv7 import (
+    RWKV7RepositoryContract,
+    validate_rwkv7_transformers_provenance,
+)
+"""
+        provenance_check = """
+with open(f'{sys.argv[1]}/config.json', encoding='utf-8') as config_handle:
+    serialized_config = json.load(config_handle)
+contract = serialized_config['rwkv7_quantization_metadata']
+validate_rwkv7_transformers_provenance(
+    RWKV7RepositoryContract.model_validate(contract['repository'])
+)
+transformers_provenance_validated = True
+"""
         quantization_import = (
             "from transformers.utils.quantization_config import "
             "CompressedTensorsConfig"
@@ -50,7 +69,6 @@ def _run_fresh_process_load(model_path, *, compressed: bool):
             "quantization_config=CompressedTensorsConfig(dequantize=True),"
         )
         contract_checks = """
-contract = config.rwkv7_quantization_metadata
 missing = sorted(
     set(contract['vllm']['quantized_weight_names'])
     & set(loading_info['missing_keys'])
@@ -85,6 +103,8 @@ protected_v_first_count = 0
 
     script = f"""
 import json, sys, torch
+{provenance_import}
+{provenance_check}
 from transformers import AutoConfig, AutoModelForCausalLM
 {quantization_import}
 
@@ -114,6 +134,7 @@ print(json.dumps({{
     'missing_quantized_weights': missing,
     'quantized_low_rank_module_count': quantized_low_rank_count,
     'protected_v_first_linear_module_count': protected_v_first_count,
+    'transformers_provenance_validated': transformers_provenance_validated,
 }}))
 """
     return subprocess.run(
@@ -121,6 +142,91 @@ print(json.dumps({{
         capture_output=True,
         text=True,
     )
+
+
+@pytest.mark.unit
+def test_rwkv7_transformers_provenance_matches_exact_editable_fork():
+    provenance = validate_rwkv7_transformers_provenance()
+
+    assert provenance.repository == (
+        "https://github.com/rwkv-rs/transformers-rwkv.git"
+    )
+    assert provenance.revision == (
+        "2696927df9363b5fa175076bb827ba4da2c4e581"
+    )
+    assert provenance.installation_source == "editable-git"
+    assert provenance.editable is True
+
+
+@pytest.mark.unit
+def test_rwkv7_transformers_provenance_rejects_registry_install(monkeypatch):
+    class _RegistryDistribution:
+        @staticmethod
+        def read_text(filename):
+            assert filename == "direct_url.json"
+            return None
+
+    monkeypatch.setattr(
+        "llmcompressor.modifiers.quantization.rwkv7."
+        "importlib_metadata.distribution",
+        lambda name: _RegistryDistribution(),
+    )
+
+    with pytest.raises(RuntimeError, match="registry-only installation"):
+        validate_rwkv7_transformers_provenance()
+
+
+@pytest.mark.unit
+def test_rwkv7_transformers_provenance_rejects_unpinned_vcs_request(monkeypatch):
+    import transformers
+
+    class _BranchVcsDistribution:
+        @staticmethod
+        def read_text(filename):
+            assert filename == "direct_url.json"
+            return json.dumps(
+                {
+                    "url": "https://github.com/rwkv-rs/transformers-rwkv.git",
+                    "vcs_info": {
+                        "vcs": "git",
+                        "requested_revision": "main",
+                        "commit_id": (
+                            "2696927df9363b5fa175076bb827ba4da2c4e581"
+                        ),
+                    },
+                }
+            )
+
+        @staticmethod
+        def locate_file(filename):
+            assert filename == "transformers/__init__.py"
+            return transformers.__file__
+
+    monkeypatch.setattr(
+        "llmcompressor.modifiers.quantization.rwkv7."
+        "importlib_metadata.distribution",
+        lambda name: _BranchVcsDistribution(),
+    )
+
+    with pytest.raises(RuntimeError, match="requested revision is not exact"):
+        validate_rwkv7_transformers_provenance()
+
+
+@pytest.mark.unit
+def test_rwkv7_transformers_provenance_rejects_revision_drift(monkeypatch):
+    monkeypatch.setattr(
+        "llmcompressor.modifiers.quantization.rwkv7."
+        "_installed_transformers_provenance",
+        lambda: RWKV7TransformersProvenance(
+            repository="https://github.com/rwkv-rs/transformers-rwkv.git",
+            revision="0" * 40,
+            installation_source="pep610-vcs",
+            editable=False,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="provenance mismatch"):
+        validate_rwkv7_transformers_provenance()
 
 
 @pytest.mark.unit
@@ -141,7 +247,7 @@ def test_artifact_contract_pins_fork_standard_names_and_v_first_protection():
         "https://github.com/rwkv-rs/llm-compressor-rwkv.git"
     )
     assert contract.repository.transformers_oid == (
-        "8ed7f67fca2da3b89a513e6524a3e6807cbe30e4"
+        "2696927df9363b5fa175076bb827ba4da2c4e581"
     )
     assert contract.checkpoint.sha256 == (
         "737079d81865801fd85e5459488d89a36d5304a524e890244eb83d44f531c89c"
@@ -270,6 +376,12 @@ def standard_linear_w8_artifact(tmp_path):
     assert audit["targets"] == contract.vllm.quantized_modules
     assert audit["quantized_weight_names"] == contract.vllm.quantized_weight_names
     assert audit["legacy_weight_aliases"] == []
+    assert audit["transformers_provenance"] == {
+        "repository": "https://github.com/rwkv-rs/transformers-rwkv.git",
+        "revision": "2696927df9363b5fa175076bb827ba4da2c4e581",
+        "installation_source": "editable-git",
+        "editable": True,
+    }
     assert not (tmp_path / "rwkv7_low_rank_w8.safetensors").exists()
     serialized_config = json.loads(
         (tmp_path / "config.json").read_text(encoding="utf-8")
@@ -340,6 +452,7 @@ def test_standard_rwkv7_unquantized_fresh_process_forward_and_generate(tmp_path)
         "missing_quantized_weights": [],
         "quantized_low_rank_module_count": 0,
         "protected_v_first_linear_module_count": 0,
+        "transformers_provenance_validated": False,
     }
 
 
@@ -361,6 +474,7 @@ def test_low_rank_w8_fresh_process_public_load_forward_and_generate(
         "missing_quantized_weights": [],
         "quantized_low_rank_module_count": 12,
         "protected_v_first_linear_module_count": 2,
+        "transformers_provenance_validated": True,
     }
 
 

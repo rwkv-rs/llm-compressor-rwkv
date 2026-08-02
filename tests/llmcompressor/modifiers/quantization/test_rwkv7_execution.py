@@ -67,6 +67,11 @@ def test_execution_falls_back_only_in_closed_order(tmp_path, monkeypatch):
         lambda *args: {"format": "nvfp4-pack-quantized"},
     )
     monkeypatch.setattr(
+        "llmcompressor.modifiers.quantization.rwkv7."
+        "validate_rwkv7_transformers_provenance",
+        lambda *args: None,
+    )
+    monkeypatch.setattr(
         "subprocess.run",
         lambda *args, **kwargs: SimpleNamespace(returncode=1, stderr="reload blocked"),
     )
@@ -92,6 +97,11 @@ def test_formal_execution_rejects_a_failed_fresh_process_reload(
     monkeypatch.setattr(
         "llmcompressor.modifiers.quantization.rwkv7.audit_rwkv7_quantized_checkpoint",
         lambda *args: {"format": "nvfp4-pack-quantized"},
+    )
+    monkeypatch.setattr(
+        "llmcompressor.modifiers.quantization.rwkv7."
+        "validate_rwkv7_transformers_provenance",
+        lambda *args: None,
     )
     monkeypatch.setattr(
         "subprocess.run",

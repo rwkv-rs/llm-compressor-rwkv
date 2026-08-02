@@ -10,8 +10,10 @@ import subprocess
 import sys
 import tempfile
 import time
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Callable, Literal
+from urllib.parse import unquote, urlparse
 
 import torch
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -23,12 +25,14 @@ __all__ = [
     "RWKV7CheckpointContract",
     "RWKV7QuantizationRecipeMetadata",
     "RWKV7RepositoryContract",
+    "RWKV7TransformersProvenance",
     "apply_rwkv7_target_policy",
+    "audit_rwkv7_quantized_checkpoint",
     "build_rwkv7_artifact_contract",
     "build_rwkv7_quantization_recipe",
     "quantize_rwkv7_oneshot",
-    "audit_rwkv7_quantized_checkpoint",
     "run_rwkv7_checkpoint_candidate",
+    "validate_rwkv7_transformers_provenance",
     "verify_rwkv7_checkpoint",
 ]
 
@@ -99,7 +103,7 @@ _LLM_COMPRESSOR_FORK_REPOSITORY = (
 _TRANSFORMERS_RWKV_REPOSITORY = (
     "https://github.com/rwkv-rs/transformers-rwkv.git"
 )
-_TRANSFORMERS_RWKV_OID = "8ed7f67fca2da3b89a513e6524a3e6807cbe30e4"
+_TRANSFORMERS_RWKV_OID = "2696927df9363b5fa175076bb827ba4da2c4e581"
 _G1H_1_5B_CHECKPOINT = {
     "model_id": "g1h-1.5b",
     "repository": "BlinkDL/rwkv7-g1",
@@ -128,8 +132,179 @@ class RWKV7RepositoryContract(BaseModel):
         "https://github.com/rwkv-rs/transformers-rwkv.git"
     ] = _TRANSFORMERS_RWKV_REPOSITORY
     transformers_oid: Literal[
-        "8ed7f67fca2da3b89a513e6524a3e6807cbe30e4"
+        "2696927df9363b5fa175076bb827ba4da2c4e581"
     ] = _TRANSFORMERS_RWKV_OID
+
+
+class RWKV7TransformersProvenance(BaseModel):
+    """Observed installation provenance for the RWKV-7 Transformers fork."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    repository: str
+    revision: str
+    installation_source: Literal["pep610-vcs", "editable-git"]
+    editable: bool
+
+    @model_validator(mode="after")
+    def validate_revision(self) -> RWKV7TransformersProvenance:
+        if re.fullmatch(r"[0-9a-f]{40}", self.revision) is None:
+            raise ValueError("RWKV-7 Transformers provenance requires a full Git OID")
+        return self
+
+
+def _canonical_repository_url(repository: str) -> str:
+    normalized = repository.strip().removeprefix("git+").rstrip("/")
+    if normalized.startswith("git@github.com:"):
+        normalized = f"https://github.com/{normalized.removeprefix('git@github.com:')}"
+    elif normalized.startswith("ssh://git@github.com/"):
+        normalized = f"https://github.com/{normalized.removeprefix('ssh://git@github.com/')}"
+    return normalized.removesuffix(".git")
+
+
+def _git_provenance_value(repository_root: Path, *arguments: str) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repository_root), *arguments],
+            capture_output=True,
+            text=True,
+        )
+    except OSError as error:
+        raise RuntimeError(
+            "RWKV-7 exact Transformers provenance requires a working Git "
+            "executable for editable installs"
+        ) from error
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError(
+            "RWKV-7 could not resolve exact Transformers Git provenance: "
+            f"git {' '.join(arguments)} failed"
+        )
+    return result.stdout.strip()
+
+
+def _installed_transformers_provenance() -> RWKV7TransformersProvenance:
+    requirement = (
+        "RWKV-7 artifact/export/load requires Transformers installed from an "
+        "exact rwkv-rs/transformers-rwkv VCS revision"
+    )
+    try:
+        distribution = importlib_metadata.distribution("transformers")
+    except importlib_metadata.PackageNotFoundError as error:
+        raise RuntimeError(
+            f"{requirement}; distribution metadata is missing"
+        ) from error
+    direct_url_text = distribution.read_text("direct_url.json")
+    if direct_url_text is None:
+        raise RuntimeError(
+            f"{requirement}; registry-only installation has no PEP 610 provenance"
+        )
+    try:
+        direct_url = json.loads(direct_url_text)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"{requirement}; direct_url.json is invalid") from error
+
+    vcs_info = direct_url.get("vcs_info")
+    if isinstance(vcs_info, dict) and vcs_info.get("vcs") == "git":
+        revision = vcs_info.get("commit_id")
+        requested_revision = vcs_info.get("requested_revision")
+        repository = direct_url.get("url")
+        if (
+            not isinstance(revision, str)
+            or not isinstance(requested_revision, str)
+            or not isinstance(repository, str)
+        ):
+            raise RuntimeError(f"{requirement}; PEP 610 VCS metadata is incomplete")
+        if requested_revision != revision:
+            raise RuntimeError(
+                f"{requirement}; requested revision is not exact resolved OID"
+            )
+
+        import transformers
+
+        module_path = Path(transformers.__file__).resolve()
+        distribution_module = Path(
+            distribution.locate_file("transformers/__init__.py")
+        ).resolve()
+        if module_path != distribution_module:
+            raise RuntimeError(
+                f"{requirement}; imported module does not belong to its distribution"
+            )
+        return RWKV7TransformersProvenance(
+            repository=repository,
+            revision=revision,
+            installation_source="pep610-vcs",
+            editable=False,
+        )
+
+    directory_info = direct_url.get("dir_info")
+    source_url = direct_url.get("url")
+    if (
+        not isinstance(directory_info, dict)
+        or directory_info.get("editable") is not True
+        or not isinstance(source_url, str)
+    ):
+        raise RuntimeError(f"{requirement}; PEP 610 metadata is not exact VCS data")
+    parsed_source = urlparse(source_url)
+    if parsed_source.scheme != "file" or parsed_source.netloc not in ("", "localhost"):
+        raise RuntimeError(f"{requirement}; editable source is not a local file URL")
+    repository_root = Path(unquote(parsed_source.path)).resolve()
+    if not repository_root.is_dir():
+        raise RuntimeError(f"{requirement}; editable source directory is missing")
+
+    import transformers
+
+    module_path = Path(transformers.__file__).resolve()
+    if not module_path.is_relative_to(repository_root):
+        raise RuntimeError(
+            f"{requirement}; imported module is outside its editable source"
+        )
+    revision = _git_provenance_value(repository_root, "rev-parse", "HEAD")
+    repository = _git_provenance_value(
+        repository_root,
+        "remote",
+        "get-url",
+        "origin",
+    )
+    dirty = subprocess.run(
+        ["git", "-C", str(repository_root), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+    )
+    if dirty.returncode != 0:
+        raise RuntimeError(f"{requirement}; editable Git status could not be read")
+    if dirty.stdout.strip():
+        raise RuntimeError(f"{requirement}; editable source is dirty")
+    return RWKV7TransformersProvenance(
+        repository=repository,
+        revision=revision,
+        installation_source="editable-git",
+        editable=True,
+    )
+
+
+def validate_rwkv7_transformers_provenance(
+    contract: RWKV7RepositoryContract | None = None,
+) -> RWKV7TransformersProvenance:
+    """Fail closed unless the installed Transformers matches the RWKV-7 fork."""
+
+    expected = RWKV7RepositoryContract() if contract is None else contract
+    observed = _installed_transformers_provenance()
+    repository_matches = _canonical_repository_url(
+        observed.repository
+    ) == _canonical_repository_url(expected.transformers_repository)
+    if not repository_matches or observed.revision != expected.transformers_oid:
+        raise RuntimeError(
+            "RWKV-7 Transformers provenance mismatch: "
+            f"expected={expected.transformers_repository}@{expected.transformers_oid} "
+            f"actual={observed.repository}@{observed.revision}"
+        )
+    from transformers.models.rwkv7 import validate_rwkv7_runtime_provenance
+
+    if not callable(validate_rwkv7_runtime_provenance):
+        raise RuntimeError(
+            "RWKV-7 Transformers fork lacks its public runtime provenance gate"
+        )
+    return observed
 
 
 class RWKV7CheckpointContract(BaseModel):
@@ -387,6 +562,7 @@ def build_rwkv7_artifact_contract(
 ) -> RWKV7ArtifactContract:
     """Resolve the exact standard-HF names protected at the runtime boundary."""
 
+    validate_rwkv7_transformers_provenance()
     if candidate not in _CANDIDATE_SCHEMES:
         raise ValueError(f"unsupported RWKV-7 candidate for artifact: {candidate}")
     if target_policy.recipe is None or target_policy.recipe.candidate != candidate:
@@ -597,6 +773,7 @@ def build_rwkv7_quantization_recipe(
         else dict(framework_versions)
     )
     _validate_framework_versions(versions)
+    validate_rwkv7_transformers_provenance()
 
     from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
 
@@ -666,6 +843,9 @@ def audit_rwkv7_quantized_checkpoint(
         ) from error
     if artifact_contract is not None and loaded_contract != artifact_contract:
         raise RuntimeError("RWKV-7 serialized artifact contract drifted")
+    transformers_provenance = validate_rwkv7_transformers_provenance(
+        loaded_contract.repository
+    )
     expected_format = (
         "pack-quantized"
         if candidate == "w8a16-low-rank-critical-high"
@@ -766,6 +946,7 @@ def audit_rwkv7_quantized_checkpoint(
         "tensor_count": len(tensors),
         "input_quantized": input_quantized,
         "artifact_contract_serialized": artifact_contract is not None,
+        "transformers_provenance": transformers_provenance.model_dump(mode="json"),
         "standard_linear_ownership": True,
         "legacy_weight_aliases": legacy_weight_aliases,
     }
@@ -792,6 +973,18 @@ def _fresh_reload_generate_script() -> str:
 
     return r"""
 import json, math, statistics, sys, time, torch
+from llmcompressor.modifiers.quantization.rwkv7 import (
+    RWKV7RepositoryContract,
+    validate_rwkv7_transformers_provenance,
+)
+
+with open(f'{sys.argv[1]}/config.json', encoding='utf-8') as config_handle:
+    serialized_config = json.load(config_handle)
+serialized_contract = serialized_config['rwkv7_quantization_metadata']
+transformers_provenance = validate_rwkv7_transformers_provenance(
+    RWKV7RepositoryContract.model_validate(serialized_contract['repository'])
+).model_dump(mode='json')
+
 from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.utils.quantization_config import CompressedTensorsConfig
 
@@ -909,6 +1102,7 @@ print(json.dumps({
     'protected_module_count': len(protected),
     'protected_tensor_count': len(protected_tensors),
     'artifact_contract_validated': True,
+    'transformers_provenance': transformers_provenance,
     'standard_linear_load': {
         'passed': True,
         'missing_quantized_weights': missing_quantized_weights,
