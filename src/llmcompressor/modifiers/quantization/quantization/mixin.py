@@ -1,5 +1,5 @@
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from compressed_tensors.distributed import wait_for_comms
@@ -41,6 +41,10 @@ from llmcompressor.modifiers.quantization.calibration import (
 )
 from llmcompressor.modifiers.quantization.group_size_validation import (
     validate_group_size_divisibility,
+)
+from llmcompressor.modifiers.quantization.rwkv7 import (
+    QuantizationTargetPolicyMetadata,
+    apply_rwkv7_target_policy,
 )
 from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.observers import ACTIVATION_OBS, fuse_weight_observers
@@ -121,6 +125,11 @@ class QuantizationMixin(HooksMixin):
     :param bypass_divisibility_checks: if True, skip the check that weight columns
         are divisible by group_size for GROUP/TENSOR_GROUP. Use when your runtime
         (e.g. vLLM) supports non-divisible dimensions. Defaults to False.
+    :param target_policy: optional model-specific fail-closed module targeting policy.
+        Currently supports ``rwkv7``, which selects standard ChannelMix projections
+        and protects recurrent TimeMix and v_first dataflow.
+    :param target_policy_metadata: resolved policy decisions written to serialized
+        recipes. This field is recomputed from the current model before quantization.
     """
 
     config_groups: dict[str, QuantizationScheme] | None = None
@@ -137,6 +146,8 @@ class QuantizationMixin(HooksMixin):
     output_observer: str | None = None
     observer: dict[str, str] | None = None
     bypass_divisibility_checks: bool = False
+    target_policy: Literal["rwkv7"] | None = None
+    target_policy_metadata: QuantizationTargetPolicyMetadata | None = None
 
     _calibration_hooks: set[RemovableHandle] = PrivateAttr(default_factory=set)
     _resolved_config: QuantizationConfig | None = PrivateAttr(None)
@@ -226,6 +237,8 @@ class QuantizationMixin(HooksMixin):
         :param model: model to attach schemes and observers to
         """
 
+        self._apply_target_policy(model)
+
         for _, module in match_named_modules(model, self.resolved_targets, self.ignore):
             reset_quantization_status(module)  # reset any previously applied qconfigs
 
@@ -236,6 +249,25 @@ class QuantizationMixin(HooksMixin):
 
         # disable quantization until calibration
         model.apply(disable_quantization)
+
+    def _apply_target_policy(self, model: torch.nn.Module) -> None:
+        if self.target_policy is None:
+            if self.target_policy_metadata is not None:
+                raise ValueError(
+                    "`target_policy_metadata` requires a matching `target_policy`."
+                )
+            return
+
+        if self.target_policy == "rwkv7":
+            policy_ignore, metadata = apply_rwkv7_target_policy(
+                model=model,
+                resolved_targets=self.resolved_targets,
+                ignore=self.ignore,
+                kv_cache_enabled=self.kv_cache_scheme is not None,
+            )
+            self.ignore = policy_ignore
+            self.target_policy_metadata = metadata
+            self._resolved_config = None
 
     def start_calibration(self, model: torch.nn.Module):
         """
