@@ -728,6 +728,78 @@ def test_w4a16_artifact_declares_exact_vllm_capability_and_target_schema(
         assert contract.vllm.quantized_modules[9] == "model.blocks.1.att.w1"
 
 
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "candidate",
+    ["nvfp4-w4a16", "nvfp4-w4a16-protection-ablation"],
+    ids=["ordinary", "protection-ablation"],
+)
+def test_w4a16_real_serializer_preserves_mainstream_config_contract(
+    tmp_path,
+    monkeypatch,
+    candidate,
+):
+    from llmcompressor.transformers.compression.compressed_tensors_utils import (
+        modify_save_pretrained,
+    )
+
+    monkeypatch.setattr(
+        rwkv7_module,
+        "validate_rwkv7_transformers_provenance",
+        _runtime_provenance,
+    )
+    model = _tiny_standard_rwkv7().eval()
+    modifier = build_rwkv7_quantization_recipe(model, candidate)
+    contract = build_rwkv7_artifact_contract(
+        modifier.target_policy_metadata,
+        candidate,
+    )
+    resolved_groups = modifier.resolved_config.config_groups
+    assert list(resolved_groups) == ["group_0"]
+    assert resolved_groups["group_0"].targets == ["Linear"]
+
+    state = State()
+    state.update(model=model, device="cpu")
+    modifier.on_initialize(state)
+    modifier.on_calibration_start(
+        state,
+        Event(type_=EventType.CALIBRATION_START),
+    )
+    modifier.on_sequential_epoch_end(
+        state,
+        Event(type_=EventType.SEQUENTIAL_EPOCH_END),
+        modules=list(model.modules()),
+    )
+    modifier.on_calibration_end(
+        state,
+        Event(type_=EventType.CALIBRATION_END),
+    )
+
+    artifact_path = tmp_path / candidate
+    setattr(
+        model.config,
+        "rwkv7_quantization_metadata",
+        contract.model_dump(mode="json"),
+    )
+    modify_save_pretrained(model)
+    model.save_pretrained(artifact_path, save_compressed=True)
+    serialized = json.loads(
+        (artifact_path / "config.json").read_text(encoding="utf-8")
+    )["quantization_config"]
+    assert list(serialized["config_groups"]) == ["group_0"]
+    assert serialized["config_groups"]["group_0"]["targets"] == ["Linear"]
+    assert set(serialized["ignore"]) == set(contract.vllm.protected_linear_modules)
+
+    audit = audit_rwkv7_quantized_checkpoint(
+        artifact_path,
+        contract.vllm.quantized_modules,
+        candidate,
+        contract,
+    )
+    assert audit["targets"] == contract.vllm.quantized_modules
+    assert audit["tensor_count"] == audit["expected_tensor_count"]
+
+
 @pytest.fixture
 def standard_linear_w8_artifact(tmp_path, monkeypatch):
     from llmcompressor.transformers.compression.compressed_tensors_utils import (
@@ -989,12 +1061,11 @@ def test_audit_rejects_missing_packed_tensor(standard_linear_w8_artifact):
 @pytest.mark.parametrize(
     ("path", "replacement"),
     [
-        (("targets",), ["model.blocks.0.ffn.key"]),
         (("weights", "symmetric"), False),
         (("weights", "num_bits"), 4),
         (("input_activations",), {"dynamic": "local"}),
     ],
-    ids=["targets", "symmetric", "bits", "unexpected-input-args"],
+    ids=["symmetric", "bits", "unexpected-input-args"],
 )
 def test_audit_rejects_serialized_config_group_drift(
     standard_linear_w8_artifact,
@@ -1014,6 +1085,64 @@ def test_audit_rejects_serialized_config_group_drift(
     )
 
     with pytest.raises(RuntimeError, match="quantization config group differs"):
+        audit_rwkv7_quantized_checkpoint(
+            artifact_path,
+            contract.vllm.quantized_modules,
+            contract.candidate,
+        )
+
+
+@pytest.mark.integration
+def test_audit_accepts_serialized_ignore_order_variation(
+    standard_linear_w8_artifact,
+):
+    artifact_path, contract, _ = standard_linear_w8_artifact
+    config_path = artifact_path / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["quantization_config"]["ignore"].reverse()
+    config_path.write_text(
+        json.dumps(config, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    audit = audit_rwkv7_quantized_checkpoint(
+        artifact_path,
+        contract.vllm.quantized_modules,
+        contract.candidate,
+    )
+    assert audit["targets"] == contract.vllm.quantized_modules
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "drift",
+    ["missing-ignore", "extra-ignore", "expanded-targets"],
+)
+def test_audit_rejects_serialized_producer_contract_drift(
+    standard_linear_w8_artifact,
+    drift,
+):
+    artifact_path, contract, _ = standard_linear_w8_artifact
+    config_path = artifact_path / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    quantization = config["quantization_config"]
+    if drift == "missing-ignore":
+        quantization["ignore"].pop()
+        error_match = "protected Linear ignore inventory"
+    elif drift == "extra-ignore":
+        quantization["ignore"].append("model.blocks.0.unowned")
+        error_match = "protected Linear ignore inventory"
+    else:
+        quantization["config_groups"]["group_0"]["targets"] = (
+            contract.vllm.quantized_modules
+        )
+        error_match = "must target exactly"
+    config_path.write_text(
+        json.dumps(config, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match=error_match):
         audit_rwkv7_quantized_checkpoint(
             artifact_path,
             contract.vllm.quantized_modules,

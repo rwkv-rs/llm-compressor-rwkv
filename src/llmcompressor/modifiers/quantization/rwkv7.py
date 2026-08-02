@@ -1587,11 +1587,32 @@ def audit_rwkv7_quantized_checkpoint(
     if not isinstance(groups, dict) or len(groups) != 1:
         raise RuntimeError("RWKV-7 checkpoint has an invalid quantization config group")
     group = next(iter(groups.values()))
+    if not isinstance(group, dict) or group.get("targets") != ["Linear"]:
+        raise RuntimeError(
+            "RWKV-7 serialized quantization config group must target exactly ['Linear']"
+        )
     expected_group = _expected_quantization_group(candidate, serialized=True)
     if group != expected_group:
         raise RuntimeError(
             "RWKV-7 serialized quantization config group differs from the exact "
             f"candidate contract: expected={expected_group} actual={group}"
+        )
+    serialized_ignore = quantization.get("ignore")
+    if not isinstance(serialized_ignore, list) or not all(
+        isinstance(name, str) for name in serialized_ignore
+    ):
+        raise RuntimeError(
+            "RWKV-7 serialized quantization ignore must be a list of Linear FQNs"
+        )
+    expected_ignore = set(loaded_contract.vllm.protected_linear_modules)
+    actual_ignore = set(serialized_ignore)
+    missing_ignore = sorted(expected_ignore - actual_ignore)
+    unexpected_ignore = sorted(actual_ignore - expected_ignore)
+    if missing_ignore or unexpected_ignore:
+        raise RuntimeError(
+            "RWKV-7 serialized protected Linear ignore inventory differs from "
+            f"candidate metadata: missing={missing_ignore} "
+            f"unexpected={unexpected_ignore}"
         )
     input_quantized = group.get("input_activations") is not None
     if input_quantized != (candidate == "nvfp4-w4a4"):
