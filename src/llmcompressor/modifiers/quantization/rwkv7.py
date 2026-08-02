@@ -21,6 +21,7 @@ __all__ = [
     "QuantizationTargetPolicyMetadata",
     "RWKV7ArtifactContract",
     "RWKV7CheckpointContract",
+    "RWKV7LowRankW8Metadata",
     "RWKV7QuantizationRecipeMetadata",
     "RWKV7RepositoryContract",
     "apply_rwkv7_target_policy",
@@ -29,6 +30,7 @@ __all__ = [
     "quantize_rwkv7_oneshot",
     "audit_rwkv7_quantized_checkpoint",
     "run_rwkv7_checkpoint_candidate",
+    "validate_rwkv7_low_rank_standard_load",
     "verify_rwkv7_checkpoint",
 ]
 
@@ -54,6 +56,9 @@ _TIME_MIX_PARAMETER_NAMES = (
     "k_a",
     "r_k",
 )
+_LOW_RANK_W8_PARAMETER_NAMES = ("w1", "w2", "a1", "a2", "g1", "g2")
+_LOW_RANK_W8_GROUP_SIZE = 128
+_LOW_RANK_W8_SIDECAR = "rwkv7_low_rank_w8.safetensors"
 _SUPPORTED_FRAMEWORK_VERSIONS = {
     "compressed_tensors": "0.17.2.a20260731",
     "transformers": "5.15.0.dev0",
@@ -71,9 +76,9 @@ _CANDIDATE_SPECS = {
         "scheme": "NVFP4A16",
         "protection_profile": "v-first-dataflow",
     },
-    "w8a16-critical-high": {
+    "w8a16-low-rank-critical-high": {
         "scheme": "W8A16",
-        "protection_profile": "critical-high",
+        "protection_profile": "low-rank-w8-critical-high",
     },
 }
 _CANDIDATE_SCHEMES = {
@@ -144,6 +149,54 @@ class RWKV7CheckpointContract(BaseModel):
     embedding_layer_norm_fused: Literal[False] = False
 
 
+class RWKV7LowRankW8Metadata(BaseModel):
+    """Intermediate raw-Parameter packing contract, not a public loader format."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    format: Literal["rwkv7-low-rank-int8-groupwise-v1"] = (
+        "rwkv7-low-rank-int8-groupwise-v1"
+    )
+    group_size: Literal[128] = _LOW_RANK_W8_GROUP_SIZE
+    packed_dtype: Literal["int8"] = "int8"
+    scale_dtype: Literal["float32"] = "float32"
+    sidecar_filename: Literal["rwkv7_low_rank_w8.safetensors"] = (
+        _LOW_RANK_W8_SIDECAR
+    )
+    parameter_names: list[str]
+    protected_v_first_parameter_names: list[str]
+    artifact_role: Literal["intermediate-serialization-only"] = (
+        "intermediate-serialization-only"
+    )
+    standard_transformers_load_supported: Literal[False] = False
+    standard_vllm_load_supported: Literal[False] = False
+    required_parameter_ownership: Literal[
+        "standard-quantizable-module-weight"
+    ] = "standard-quantizable-module-weight"
+    integration_blocker: Literal[
+        "transformers-rwkv-and-vllm-module-ownership"
+    ] = (
+        "transformers-rwkv-and-vllm-module-ownership"
+    )
+
+    @model_validator(mode="after")
+    def validate_parameter_inventory(self) -> RWKV7LowRankW8Metadata:
+        if not self.parameter_names or len(self.parameter_names) != len(
+            set(self.parameter_names)
+        ):
+            raise ValueError(
+                "RWKV-7 low-rank W8 Parameters must be non-empty and unique"
+            )
+        low_rank_suffixes = tuple(
+            f".{name}" for name in _LOW_RANK_W8_PARAMETER_NAMES
+        )
+        if any(not name.endswith(low_rank_suffixes) for name in self.parameter_names):
+            raise ValueError("RWKV-7 low-rank W8 inventory contains a non-w/a/g tensor")
+        if set(self.parameter_names) & set(self.protected_v_first_parameter_names):
+            raise ValueError("RWKV-7 low-rank W8 inventory overlaps the v_first path")
+        return self
+
+
 class RWKV7VLLMLoaderMetadata(BaseModel):
     """Metadata consumed by the standard-HF vLLM-RWKV loader boundary."""
 
@@ -165,6 +218,7 @@ class RWKV7VLLMLoaderMetadata(BaseModel):
     quantized_modules: list[str]
     protected_modules: list[str]
     protected_tensors: list[str]
+    low_rank_w8: RWKV7LowRankW8Metadata | None = None
 
 
 class RWKV7ArtifactContract(BaseModel):
@@ -179,7 +233,7 @@ class RWKV7ArtifactContract(BaseModel):
         "nvfp4-w4a4",
         "nvfp4-w4a16",
         "nvfp4-w4a16-protection-ablation",
-        "w8a16-critical-high",
+        "w8a16-low-rank-critical-high",
     ]
     target_policy: QuantizationTargetPolicyMetadata
     vllm: RWKV7VLLMLoaderMetadata
@@ -197,7 +251,7 @@ class RWKV7QuantizationRecipeMetadata(BaseModel):
         "nvfp4-w4a4",
         "nvfp4-w4a16",
         "nvfp4-w4a16-protection-ablation",
-        "w8a16-critical-high",
+        "w8a16-low-rank-critical-high",
     ]
     candidate_order: list[str]
     algorithm: Literal["NVFP4", "INT8"]
@@ -207,7 +261,12 @@ class RWKV7QuantizationRecipeMetadata(BaseModel):
     input_dtype: Literal["float4", "float16"]
     input_scale: Literal["dynamic_local", "none"]
     input_scale_dtype: Literal["float8_e4m3fn"] | None
-    protection_profile: Literal["critical-high", "v-first-dataflow"]
+    protection_profile: Literal[
+        "critical-high",
+        "v-first-dataflow",
+        "low-rank-w8-critical-high",
+    ]
+    low_rank_weight_dtype: Literal["none", "int8"]
     targets: list[str]
     framework_versions: dict[str, str]
     quantization_applied: Literal[False] = False
@@ -223,6 +282,9 @@ class RWKV7QuantizationRecipeMetadata(BaseModel):
             raise ValueError(
                 "RWKV-7 quantization recipe requires resolved ChannelMix targets"
             )
+        expects_low_rank_w8 = self.candidate == "w8a16-low-rank-critical-high"
+        if (self.low_rank_weight_dtype == "int8") != expects_low_rank_w8:
+            raise ValueError("RWKV-7 low-rank W8 recipe metadata is inconsistent")
         return self
 
 
@@ -244,11 +306,14 @@ class QuantizationTargetPolicyMetadata(BaseModel):
     policy: Literal["rwkv7"] = "rwkv7"
     policy_version: Literal[1] = 1
     model_type: Literal["rwkv7"] = "rwkv7"
-    protection_profile: Literal["critical-high", "v-first-dataflow"] = (
-        "critical-high"
-    )
+    protection_profile: Literal[
+        "critical-high",
+        "v-first-dataflow",
+        "low-rank-w8-critical-high",
+    ] = "critical-high"
     base_model_prefix: str
     selection: QuantizationTargetPolicyDecision
+    parameter_selection: QuantizationTargetPolicyDecision | None = None
     protections: list[QuantizationTargetPolicyDecision]
     recipe: RWKV7QuantizationRecipeMetadata | None = None
 
@@ -279,6 +344,30 @@ def build_rwkv7_artifact_contract(
         if decision.kind == "tensor"
         for name in decision.names
     ]
+    parameter_selection = target_policy.parameter_selection
+    if candidate == "w8a16-low-rank-critical-high":
+        if parameter_selection is None or parameter_selection.kind != "tensor":
+            raise ValueError("RWKV-7 low-rank W8 candidate lacks raw Parameters")
+        low_rank_names = list(parameter_selection.names)
+        if not low_rank_names or any(
+            name.endswith((".v1", ".v2")) for name in low_rank_names
+        ):
+            raise ValueError("RWKV-7 low-rank W8 selection touches v_first gating")
+        protected_v_first_names = sorted(
+            name
+            for name in protected_tensors
+            if name.endswith((".v0", ".v1", ".v2"))
+        )
+        low_rank_w8 = RWKV7LowRankW8Metadata(
+            parameter_names=low_rank_names,
+            protected_v_first_parameter_names=protected_v_first_names,
+        )
+    else:
+        if parameter_selection is not None:
+            raise ValueError(
+                "RWKV-7 non-W8 candidate unexpectedly selects raw Parameters"
+            )
+        low_rank_w8 = None
     layer_zero_value = f"{target_policy.base_model_prefix}.blocks.0.att.value"
     if layer_zero_value not in protected_modules:
         raise ValueError(
@@ -294,12 +383,13 @@ def build_rwkv7_artifact_contract(
         vllm=RWKV7VLLMLoaderMetadata(
             quantization_format=(
                 "pack-quantized"
-                if candidate == "w8a16-critical-high"
+                if candidate == "w8a16-low-rank-critical-high"
                 else "nvfp4-pack-quantized"
             ),
             quantized_modules=list(target_policy.selection.names),
             protected_modules=protected_modules,
             protected_tensors=protected_tensors,
+            low_rank_w8=low_rank_w8,
         ),
         formal_checkpoint=checkpoint is not None,
     )
@@ -333,7 +423,7 @@ def _validate_candidate_scheme(
     weights = scheme.weights
     inputs = scheme.input_activations
     expected_inputs = candidate == "nvfp4-w4a4"
-    is_w8 = candidate == "w8a16-critical-high"
+    is_w8 = candidate == "w8a16-low-rank-critical-high"
     if is_w8:
         valid_weights = (
             weights is not None
@@ -379,6 +469,7 @@ def _validate_candidate_scheme(
         input_scale="dynamic_local" if inputs is not None else "none",
         input_scale_dtype="float8_e4m3fn" if inputs is not None else None,
         protection_profile=_CANDIDATE_SPECS[candidate]["protection_profile"],
+        low_rank_weight_dtype="int8" if is_w8 else "none",
         targets=targets,
         framework_versions=framework_versions,
     )
@@ -429,6 +520,287 @@ def build_rwkv7_quantization_recipe(
     return modifier
 
 
+def _quantize_rwkv7_low_rank_tensor(
+    tensor: torch.Tensor,
+    *,
+    group_size: int = _LOW_RANK_W8_GROUP_SIZE,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if tensor.ndim != 2 or not tensor.numel() or not torch.isfinite(tensor).all():
+        raise ValueError("RWKV-7 low-rank W8 requires a finite non-empty matrix")
+    if group_size < 1:
+        raise ValueError("RWKV-7 low-rank W8 group_size must be positive")
+    rows, columns = tensor.shape
+    groups = (columns + group_size - 1) // group_size
+    padded_columns = groups * group_size
+    work = tensor.detach().to(device="cpu", dtype=torch.float32)
+    if padded_columns != columns:
+        work = torch.nn.functional.pad(work, (0, padded_columns - columns))
+    grouped = work.reshape(rows, groups, group_size)
+    scales = grouped.abs().amax(dim=-1) / 127.0
+    scales = torch.where(scales == 0, torch.ones_like(scales), scales)
+    packed = torch.round(grouped / scales.unsqueeze(-1)).clamp(-127, 127)
+    packed = packed.to(torch.int8).reshape(rows, padded_columns)[:, :columns]
+    return packed.contiguous(), scales.contiguous()
+
+
+def _dequantize_rwkv7_low_rank_tensor(
+    packed: torch.Tensor,
+    scales: torch.Tensor,
+    *,
+    group_size: int = _LOW_RANK_W8_GROUP_SIZE,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    if packed.ndim != 2 or packed.dtype != torch.int8:
+        raise ValueError("RWKV-7 low-rank packed tensor must be a 2D int8 matrix")
+    rows, columns = packed.shape
+    expected_groups = (columns + group_size - 1) // group_size
+    if scales.shape != (rows, expected_groups) or scales.dtype != torch.float32:
+        raise ValueError("RWKV-7 low-rank scale tensor has an invalid shape or dtype")
+    expanded = scales.unsqueeze(-1).expand(rows, expected_groups, group_size)
+    expanded = expanded.reshape(rows, expected_groups * group_size)[:, :columns]
+    return (packed.to(torch.float32) * expanded).to(dtype=dtype)
+
+
+def _apply_rwkv7_low_rank_w8(
+    model: torch.nn.Module,
+    metadata: RWKV7LowRankW8Metadata,
+) -> dict[str, Any]:
+    errors = {}
+    with torch.inference_mode():
+        for name in metadata.parameter_names:
+            parameter = model.get_parameter(name)
+            original = parameter.detach().to(torch.float32).cpu().clone()
+            packed, scales = _quantize_rwkv7_low_rank_tensor(
+                original,
+                group_size=metadata.group_size,
+            )
+            dequantized = _dequantize_rwkv7_low_rank_tensor(
+                packed,
+                scales,
+                group_size=metadata.group_size,
+                dtype=parameter.dtype,
+            ).to(device=parameter.device)
+            parameter.copy_(dequantized)
+            errors[name] = float(
+                (original.cpu() - dequantized.float().cpu()).abs().max().item()
+            )
+    return {
+        "applied": True,
+        "parameter_count": len(metadata.parameter_names),
+        "max_abs_error": max(errors.values(), default=0.0),
+        "parameter_max_abs_error": errors,
+    }
+
+
+def _model_safetensor_shards(directory: Path) -> list[Path]:
+    shards = [
+        path
+        for path in sorted(directory.glob("model*.safetensors"))
+        if path.name != _LOW_RANK_W8_SIDECAR
+    ]
+    if not shards:
+        raise RuntimeError("RWKV-7 artifact has no model safetensors shards")
+    return shards
+
+
+def _serialize_rwkv7_low_rank_w8(
+    directory: Path,
+    metadata: RWKV7LowRankW8Metadata,
+) -> dict[str, Any]:
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    shards = _model_safetensor_shards(directory)
+    locations = {}
+    for shard in shards:
+        with safe_open(shard, framework="pt", device="cpu") as handle:
+            for name in metadata.parameter_names:
+                if name in handle.keys():
+                    if name in locations:
+                        raise RuntimeError(
+                            f"RWKV-7 low-rank Parameter is duplicated: {name}"
+                        )
+                    locations[name] = shard
+    missing = sorted(set(metadata.parameter_names) - locations.keys())
+    if missing:
+        raise RuntimeError(f"RWKV-7 low-rank Parameters are missing: {missing}")
+
+    sidecar = {}
+    standard_total_size = 0
+    for shard in shards:
+        with safe_open(shard, framework="pt", device="cpu") as handle:
+            shard_metadata = handle.metadata()
+            tensors = {name: handle.get_tensor(name) for name in handle.keys()}
+        for name in metadata.parameter_names:
+            if locations[name] != shard:
+                continue
+            tensor = tensors.pop(name)
+            packed, scales = _quantize_rwkv7_low_rank_tensor(
+                tensor,
+                group_size=metadata.group_size,
+            )
+            sidecar[f"{name}.packed"] = packed
+            sidecar[f"{name}.scale"] = scales
+        standard_total_size += sum(
+            tensor.numel() * tensor.element_size() for tensor in tensors.values()
+        )
+        temporary = shard.with_name(f".{shard.name}.rwkv7.tmp")
+        temporary.unlink(missing_ok=True)
+        save_file(tensors, temporary, metadata=shard_metadata or {"format": "pt"})
+        os.replace(temporary, shard)
+
+    sidecar_path = directory / metadata.sidecar_filename
+    temporary_sidecar = sidecar_path.with_name(f".{sidecar_path.name}.tmp")
+    temporary_sidecar.unlink(missing_ok=True)
+    save_file(sidecar, temporary_sidecar, metadata={"format": "pt"})
+    os.replace(temporary_sidecar, sidecar_path)
+
+    index_path = directory / "model.safetensors.index.json"
+    if index_path.is_file():
+        index = _read_json_file(index_path, "RWKV-7 safetensors index")
+        weight_map = index.get("weight_map")
+        if not isinstance(weight_map, dict):
+            raise RuntimeError("RWKV-7 safetensors index has no weight_map")
+        for name in metadata.parameter_names:
+            if weight_map.pop(name, None) is None:
+                raise RuntimeError(
+                    f"RWKV-7 safetensors index lacks low-rank Parameter: {name}"
+                )
+        index_metadata = index.setdefault("metadata", {})
+        if isinstance(index_metadata, dict):
+            index_metadata["total_size"] = standard_total_size
+        _atomic_json(index_path, index)
+
+    packed_size = sum(
+        tensor.numel()
+        for tensor in sidecar.values()
+        if tensor.dtype == torch.int8
+    )
+    scale_size = sum(
+        tensor.numel() * tensor.element_size()
+        for tensor in sidecar.values()
+        if tensor.dtype == torch.float32
+    )
+    return {
+        "sidecar_filename": metadata.sidecar_filename,
+        "sidecar_sha256": _sha256_file(sidecar_path),
+        "parameter_count": len(metadata.parameter_names),
+        "packed_bytes": packed_size,
+        "scale_bytes": scale_size,
+    }
+
+
+def _iter_rwkv7_low_rank_w8_dequantized(
+    directory: Path | str,
+    metadata: RWKV7LowRankW8Metadata | dict[str, Any],
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+):
+    """Inspect an intermediate sidecar without defining a model loading path."""
+    from safetensors.torch import load_file
+
+    directory = Path(directory)
+    contract = RWKV7LowRankW8Metadata.model_validate(metadata)
+    sidecar = load_file(directory / contract.sidecar_filename, device="cpu")
+    expected_keys = {
+        f"{name}.{suffix}"
+        for name in contract.parameter_names
+        for suffix in ("packed", "scale")
+    }
+    if set(sidecar) != expected_keys:
+        raise RuntimeError("RWKV-7 low-rank W8 sidecar tensor inventory drifted")
+    for name in contract.parameter_names:
+        yield name, _dequantize_rwkv7_low_rank_tensor(
+            sidecar[f"{name}.packed"],
+            sidecar[f"{name}.scale"],
+            group_size=contract.group_size,
+            dtype=dtype,
+        )
+
+
+def validate_rwkv7_low_rank_standard_load(
+    loading_info: dict[str, Any],
+    metadata: RWKV7LowRankW8Metadata | dict[str, Any],
+) -> dict[str, Any]:
+    """Fail closed until the public Transformers loader owns low-rank W8."""
+
+    contract = RWKV7LowRankW8Metadata.model_validate(metadata)
+    missing_keys = loading_info.get("missing_keys")
+    if not isinstance(missing_keys, (list, tuple, set, frozenset)) or not all(
+        isinstance(name, str) for name in missing_keys
+    ):
+        raise RuntimeError(
+            "standard Transformers loading info lacks a valid missing_keys inventory"
+        )
+    missing_low_rank = sorted(set(contract.parameter_names) & set(missing_keys))
+    if missing_low_rank:
+        raise RuntimeError(
+            "standard Transformers loader did not restore RWKV-7 low-rank W8 "
+            f"Parameters: {missing_low_rank}"
+        )
+    if not contract.standard_transformers_load_supported:
+        raise RuntimeError(
+            "RWKV-7 low-rank W8 is an intermediate serialization artifact; "
+            "standard Transformers module/weight ownership is not integrated"
+        )
+    return {
+        "passed": True,
+        "format": contract.format,
+        "parameter_count": len(contract.parameter_names),
+        "parameter_names": contract.parameter_names,
+        "standard_transformers_load_supported": True,
+    }
+
+
+def _read_json_file(path: Path, label: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"{label} is not readable JSON: {path}") from error
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{label} must contain a JSON object")
+    return payload
+
+
+def _audit_rwkv7_low_rank_w8(
+    directory: Path,
+    metadata: RWKV7LowRankW8Metadata,
+) -> dict[str, Any]:
+    from safetensors import safe_open
+
+    model_tensor_names = set()
+    for shard in _model_safetensor_shards(directory):
+        with safe_open(shard, framework="pt", device="cpu") as handle:
+            model_tensor_names.update(handle.keys())
+    retained = sorted(set(metadata.parameter_names) & model_tensor_names)
+    if retained:
+        raise RuntimeError(
+            f"RWKV-7 low-rank raw Parameters remained uncompressed: {retained}"
+        )
+    restored = list(
+        _iter_rwkv7_low_rank_w8_dequantized(
+            directory,
+            metadata,
+            dtype=torch.float32,
+        )
+    )
+    return {
+        "format": metadata.format,
+        "parameter_count": len(restored),
+        "parameter_names": [name for name, _ in restored],
+        "all_finite": all(torch.isfinite(tensor).all() for _, tensor in restored),
+        "v_first_protected": not (
+            set(metadata.parameter_names)
+            & set(metadata.protected_v_first_parameter_names)
+        ),
+        "artifact_role": metadata.artifact_role,
+        "standard_transformers_load_supported": (
+            metadata.standard_transformers_load_supported
+        ),
+        "standard_vllm_load_supported": metadata.standard_vllm_load_supported,
+    }
+
+
 def audit_rwkv7_quantized_checkpoint(
     output_dir: Path,
     expected_targets: list[str],
@@ -447,7 +819,7 @@ def audit_rwkv7_quantized_checkpoint(
             raise RuntimeError("RWKV-7 serialized artifact contract drifted")
     expected_format = (
         "pack-quantized"
-        if candidate == "w8a16-critical-high"
+        if candidate == "w8a16-low-rank-critical-high"
         else "nvfp4-pack-quantized"
     )
     if (
@@ -467,6 +839,8 @@ def audit_rwkv7_quantized_checkpoint(
         )
     tensors: dict[str, tuple[list[int], str]] = {}
     for shard in sorted(output_dir.glob("*.safetensors")):
+        if shard.name == _LOW_RANK_W8_SIDECAR:
+            continue
         with safe_open(shard, framework="pt", device="cpu") as handle:
             for name in handle.keys():
                 tensors[name] = (
@@ -474,7 +848,7 @@ def audit_rwkv7_quantized_checkpoint(
                     handle.get_slice(name).get_dtype(),
                 )
     for target in expected_targets:
-        if candidate == "w8a16-critical-high":
+        if candidate == "w8a16-low-rank-critical-high":
             required = {
                 f"{target}.weight_packed",
                 f"{target}.weight_scale",
@@ -497,14 +871,14 @@ def audit_rwkv7_quantized_checkpoint(
                 f"{target}; missing={missing}"
             )
         expected_packed_dtype = (
-            "I32" if candidate == "w8a16-critical-high" else "U8"
+            "I32" if candidate == "w8a16-low-rank-critical-high" else "U8"
         )
         if tensors[f"{target}.weight_packed"][1] != expected_packed_dtype:
             raise RuntimeError(
                 f"RWKV-7 target has drifted packed dtype: {target}"
             )
         if (
-            candidate != "w8a16-critical-high"
+            candidate != "w8a16-low-rank-critical-high"
             and tensors[f"{target}.weight_scale"][1] != "F8_E4M3"
         ):
             raise RuntimeError(f"RWKV-7 target has drifted scale dtype: {target}")
@@ -520,6 +894,12 @@ def audit_rwkv7_quantized_checkpoint(
                     f"RWKV-7 protected module was compressed: {name}"
                 )
     protected = sorted(protected_names & tensors.keys())
+    low_rank_w8 = None
+    if artifact_contract is not None and artifact_contract.vllm.low_rank_w8:
+        low_rank_w8 = _audit_rwkv7_low_rank_w8(
+            output_dir,
+            artifact_contract.vllm.low_rank_w8,
+        )
     return {
         "format": expected_format,
         "targets": expected_targets,
@@ -527,6 +907,7 @@ def audit_rwkv7_quantized_checkpoint(
         "tensor_count": len(tensors),
         "input_quantized": input_quantized,
         "artifact_contract_serialized": artifact_contract is not None,
+        "low_rank_w8": low_rank_w8,
     }
 
 
@@ -551,6 +932,9 @@ def _fresh_reload_generate_script() -> str:
 
     return r"""
 import json, math, statistics, sys, time, torch
+from llmcompressor.modifiers.quantization.rwkv7 import (
+    validate_rwkv7_low_rank_standard_load,
+)
 from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.utils.quantization_config import CompressedTensorsConfig
 
@@ -570,7 +954,7 @@ assert contract['candidate'] in (
     'nvfp4-w4a4',
     'nvfp4-w4a16',
     'nvfp4-w4a16-protection-ablation',
-    'w8a16-critical-high',
+    'w8a16-low-rank-critical-high',
 )
 assert contract['vllm']['architecture'] == 'Rwkv7ForCausalLM'
 assert contract['vllm']['source_format'] == 'standard_hf'
@@ -579,12 +963,20 @@ assert contract['vllm']['legacy_pth_direct_load'] is False
 torch.cuda.reset_peak_memory_stats()
 torch.cuda.synchronize()
 load_started = time.perf_counter()
-model = AutoModelForCausalLM.from_pretrained(
+model, loading_info = AutoModelForCausalLM.from_pretrained(
     sys.argv[1],
     device_map='cuda',
     dtype=runtime_dtype,
     quantization_config=CompressedTensorsConfig(dequantize=True),
-).to(dtype=runtime_dtype).eval()
+    output_loading_info=True,
+)
+low_rank_contract = contract['vllm'].get('low_rank_w8')
+low_rank_standard_load = (
+    validate_rwkv7_low_rank_standard_load(loading_info, low_rank_contract)
+    if low_rank_contract is not None
+    else None
+)
+model = model.to(dtype=runtime_dtype).eval()
 torch.cuda.synchronize()
 load_latency_ms = (time.perf_counter() - load_started) * 1000.0
 load_peak_allocated_bytes = torch.cuda.max_memory_allocated()
@@ -655,6 +1047,7 @@ print(json.dumps({
     'protected_module_count': len(protected),
     'protected_tensor_count': len(protected_tensors),
     'artifact_contract_validated': True,
+    'low_rank_w8': low_rank_standard_load,
     'runtime_measurement': {
         'scope': 'fresh-process-transformers-generate-diagnostic',
         'canonical_performance_acceptance': False,
@@ -771,6 +1164,12 @@ def quantize_rwkv7_oneshot(
                     else None
                 ),
             }
+            low_rank_runtime = None
+            if artifact_contract.vllm.low_rank_w8 is not None:
+                low_rank_runtime = _apply_rwkv7_low_rank_w8(
+                    result,
+                    artifact_contract.vllm.low_rank_w8,
+                )
             base_model = result.base_model
             first_channel_mix = base_model.blocks[0].ffn
             reference = next(result.parameters())
@@ -803,6 +1202,12 @@ def quantize_rwkv7_oneshot(
                 artifact_contract.model_dump(mode="json"),
             )
             result.save_pretrained(destination, save_compressed=True)
+            low_rank_serialization = None
+            if artifact_contract.vllm.low_rank_w8 is not None:
+                low_rank_serialization = _serialize_rwkv7_low_rank_w8(
+                    destination,
+                    artifact_contract.vllm.low_rank_w8,
+                )
             if processor is not None and hasattr(processor, "save_pretrained"):
                 processor.save_pretrained(destination)
             audit = audit_rwkv7_quantized_checkpoint(
@@ -857,6 +1262,10 @@ def quantize_rwkv7_oneshot(
                 "state_shape": list(cell_state.shape),
             },
             "quantization_runtime": quantization_runtime,
+            "low_rank_w8": {
+                "runtime": low_rank_runtime,
+                "serialization": low_rank_serialization,
+            },
             "fresh_reload": {
                 "passed": reload_run.returncode == 0,
                 "returncode": reload_run.returncode,
@@ -1064,7 +1473,7 @@ def run_rwkv7_checkpoint_candidate(
         "nvfp4-w4a4",
         "nvfp4-w4a16",
         "nvfp4-w4a16-protection-ablation",
-        "w8a16-critical-high",
+        "w8a16-low-rank-critical-high",
     ],
     max_calibration_samples: int = 128,
     max_calibration_length: int = 1024,
@@ -1262,9 +1671,11 @@ def apply_rwkv7_target_policy(
     resolved_targets: set[str],
     ignore: list[str],
     kv_cache_enabled: bool,
-    protection_profile: Literal["critical-high", "v-first-dataflow"] = (
-        "critical-high"
-    ),
+    protection_profile: Literal[
+        "critical-high",
+        "v-first-dataflow",
+        "low-rank-w8-critical-high",
+    ] = "critical-high",
 ) -> tuple[list[str], QuantizationTargetPolicyMetadata]:
     """Validate standard RWKV-7 structure and select only ChannelMix linears.
 
@@ -1276,7 +1687,7 @@ def apply_rwkv7_target_policy(
     base_model_prefix, base_model = _resolve_standard_base_model(model)
     attention_ignore = _attention_ignore(base_model_prefix)
     attention_value_ignore = _attention_value_ignore(base_model_prefix)
-    if protection_profile == "critical-high":
+    if protection_profile in {"critical-high", "low-rank-w8-critical-high"}:
         required_ignore = [attention_ignore, _HEAD_IGNORE]
     elif protection_profile == "v-first-dataflow":
         required_ignore = [attention_value_ignore, _HEAD_IGNORE]
@@ -1310,6 +1721,7 @@ def apply_rwkv7_target_policy(
     other_time_mix_modules: list[str] = []
     later_value_tensors: list[str] = []
     recurrent_time_mix_tensors: list[str] = []
+    selected_low_rank_tensors: list[str] = []
     expected_linear_modules = {_HEAD_IGNORE}
 
     _require_module(model, "head", torch.nn.Linear, "head")
@@ -1333,7 +1745,13 @@ def apply_rwkv7_target_policy(
                 parameter_name,
                 parameter_path,
             )
-            recurrent_time_mix_tensors.append(parameter_path)
+            if (
+                protection_profile == "low-rank-w8-critical-high"
+                and parameter_name in _LOW_RANK_W8_PARAMETER_NAMES
+            ):
+                selected_low_rank_tensors.append(parameter_path)
+            else:
+                recurrent_time_mix_tensors.append(parameter_path)
         for parameter_name in ("v0", "v1", "v2"):
             parameter_path = f"{block_path}.att.{parameter_name}"
             if layer_id == 0:
@@ -1407,14 +1825,14 @@ def apply_rwkv7_target_policy(
             ),
         ),
     ]
-    if protection_profile == "critical-high":
+    if protection_profile in {"critical-high", "low-rank-w8-critical-high"}:
         protections.append(
             QuantizationTargetPolicyDecision(
                 kind="module",
                 names=other_time_mix_modules,
                 reason=(
                     "Keep the remaining TimeMix projections high precision in "
-                    "the critical-high candidate."
+                    "critical-high candidates."
                 ),
             )
         )
@@ -1429,9 +1847,8 @@ def apply_rwkv7_target_policy(
                 kind="tensor",
                 names=recurrent_time_mix_tensors,
                 reason=(
-                    "Keep the standard raw TimeMix low-rank/recurrent parameters "
-                    "high precision until the standard Transformers and vLLM "
-                    "loaders expose a compressed parameter contract."
+                    "Keep all unselected TimeMix recurrent Parameters high "
+                    "precision; v0/v1/v2 remain on the protected v_first path."
                 ),
             ),
         ]
@@ -1447,6 +1864,18 @@ def apply_rwkv7_target_policy(
                 "v-first-dataflow ablation only, non-value TimeMix projections; "
                 "the complete v_first value path remains high precision."
             ),
+        ),
+        parameter_selection=(
+            QuantizationTargetPolicyDecision(
+                kind="tensor",
+                names=selected_low_rank_tensors,
+                reason=(
+                    "Quantize only standard raw w/a/g low-rank Parameters to W8; "
+                    "v1/v2 and the layer-0 value projection remain high precision."
+                ),
+            )
+            if selected_low_rank_tensors
+            else None
         ),
         protections=protections,
     )

@@ -2,14 +2,23 @@
 
 import hashlib
 import json
+import subprocess
+import sys
 
 import pytest
+import torch
 
 from llmcompressor.modifiers.quantization.rwkv7 import (
     RWKV7CheckpointContract,
+    _apply_rwkv7_low_rank_w8,
+    _audit_rwkv7_low_rank_w8,
+    _fresh_reload_generate_script,
+    _iter_rwkv7_low_rank_w8_dequantized,
     _load_calibration_records,
+    _serialize_rwkv7_low_rank_w8,
     build_rwkv7_artifact_contract,
     build_rwkv7_quantization_recipe,
+    validate_rwkv7_low_rank_standard_load,
     verify_rwkv7_checkpoint,
 )
 
@@ -62,6 +71,135 @@ def test_artifact_contract_pins_fork_standard_names_and_v_first_protection():
     ]
     assert contract.formal_checkpoint is True
     assert contract.formal_evaluation is False
+
+
+@pytest.mark.unit
+def test_low_rank_w8_intermediate_sidecar_and_standard_load_fail_closed(
+    tmp_path,
+):
+    from transformers import AutoModelForCausalLM
+
+    model = _tiny_standard_rwkv7().eval()
+    modifier = build_rwkv7_quantization_recipe(
+        model,
+        "w8a16-low-rank-critical-high",
+    )
+    contract = build_rwkv7_artifact_contract(
+        modifier.target_policy_metadata,
+        "w8a16-low-rank-critical-high",
+    )
+    low_rank = contract.vllm.low_rank_w8
+    assert low_rank is not None
+    assert contract.vllm.quantization_format == "pack-quantized"
+    assert contract.vllm.quantized_modules == [
+        "model.blocks.0.ffn.key",
+        "model.blocks.0.ffn.value",
+        "model.blocks.1.ffn.key",
+        "model.blocks.1.ffn.value",
+    ]
+    assert not set(contract.vllm.quantized_modules) & set(low_rank.parameter_names)
+    assert low_rank.artifact_role == "intermediate-serialization-only"
+    assert low_rank.standard_transformers_load_supported is False
+    assert low_rank.standard_vllm_load_supported is False
+    assert low_rank.required_parameter_ownership == (
+        "standard-quantizable-module-weight"
+    )
+    fresh_reload_script = _fresh_reload_generate_script()
+    assert "restore_rwkv7_low_rank_w8" not in fresh_reload_script
+    assert "output_loading_info=True" in fresh_reload_script
+    assert "validate_rwkv7_low_rank_standard_load" in fresh_reload_script
+    assert "model.blocks.1.att.v1" in low_rank.protected_v_first_parameter_names
+    with torch.no_grad():
+        for index, name in enumerate(low_rank.parameter_names, start=1):
+            model.get_parameter(name).uniform_(-0.25 * index, 0.25 * index)
+    protected_before = {
+        name: model.get_parameter(name).detach().clone()
+        for name in low_rank.protected_v_first_parameter_names
+    }
+
+    runtime = _apply_rwkv7_low_rank_w8(model, low_rank)
+    expected = {
+        name: model.get_parameter(name).detach().clone()
+        for name in low_rank.parameter_names
+    }
+    with torch.inference_mode():
+        logits = model(torch.tensor([[1, 2, 3]]), use_cache=True).logits
+    assert logits.shape == (1, 3, 32)
+    assert torch.isfinite(logits).all()
+    for name, tensor in protected_before.items():
+        assert torch.equal(model.get_parameter(name), tensor)
+
+    setattr(
+        model.config,
+        "rwkv7_quantization_metadata",
+        contract.model_dump(mode="json"),
+    )
+    model.save_pretrained(tmp_path, safe_serialization=True)
+    serialization = _serialize_rwkv7_low_rank_w8(tmp_path, low_rank)
+    audit = _audit_rwkv7_low_rank_w8(tmp_path, low_rank)
+
+    assert runtime["parameter_count"] == 12
+    assert runtime["max_abs_error"] > 0
+    assert serialization["parameter_count"] == 12
+    assert serialization["packed_bytes"] + serialization["scale_bytes"] < sum(
+        tensor.numel() * tensor.element_size() for tensor in expected.values()
+    )
+    assert audit["parameter_names"] == low_rank.parameter_names
+    assert audit["all_finite"] is True
+    assert audit["v_first_protected"] is True
+    assert audit["artifact_role"] == "intermediate-serialization-only"
+    assert audit["standard_transformers_load_supported"] is False
+    assert audit["standard_vllm_load_supported"] is False
+    intermediate = dict(
+        _iter_rwkv7_low_rank_w8_dequantized(
+            tmp_path,
+            low_rank,
+            dtype=torch.float32,
+        )
+    )
+    for name, tensor in expected.items():
+        assert torch.equal(intermediate[name], tensor.float())
+
+    _, loading_info = AutoModelForCausalLM.from_pretrained(
+        tmp_path,
+        output_loading_info=True,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="standard Transformers loader did not restore RWKV-7 low-rank W8",
+    ):
+        validate_rwkv7_low_rank_standard_load(loading_info, low_rank)
+    assert set(low_rank.parameter_names) <= set(loading_info["missing_keys"])
+
+    fresh_process = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
+from transformers import AutoConfig, AutoModelForCausalLM
+from llmcompressor.modifiers.quantization.rwkv7 import (
+    validate_rwkv7_low_rank_standard_load,
+)
+
+config = AutoConfig.from_pretrained(sys.argv[1])
+contract = config.rwkv7_quantization_metadata['vllm']['low_rank_w8']
+_, loading_info = AutoModelForCausalLM.from_pretrained(
+    sys.argv[1],
+    output_loading_info=True,
+)
+validate_rwkv7_low_rank_standard_load(loading_info, contract)
+""",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert fresh_process.returncode != 0
+    assert (
+        "standard Transformers loader did not restore RWKV-7 low-rank W8"
+        in fresh_process.stderr
+    )
 
 
 @pytest.mark.unit

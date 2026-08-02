@@ -57,7 +57,8 @@ class QuantizationModifier(Modifier, QuantizationMixin):
         ``rwkv7`` selects only the standard ChannelMix projections and records its
         recurrent TimeMix and v_first protections in recipe metadata.
     :param target_policy_profile: protection profile used by ``rwkv7``. The explicit
-        ``v-first-dataflow`` ablation never unprotects the v_first dataflow.
+        ``low-rank-w8-critical-high`` profile quantizes raw w/a/g low-rank
+        Parameters separately from Linear weights. No profile unprotects v_first.
     """
 
     def on_initialize(self, state: State, **kwargs) -> bool:

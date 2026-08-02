@@ -131,8 +131,9 @@ class QuantizationMixin(HooksMixin):
     :param target_policy_metadata: resolved policy decisions written to serialized
         recipes. This field is recomputed from the current model before quantization.
     :param target_policy_profile: RWKV-7 protection profile. ``critical-high``
-        quantizes only ChannelMix projections; ``v-first-dataflow`` is the explicit
-        protection ablation and still keeps every v_first producer/consumer precise.
+        quantizes only ChannelMix projections, ``low-rank-w8-critical-high`` also
+        quantizes raw w/a/g low-rank Parameters, and ``v-first-dataflow`` is the
+        explicit protection ablation. Every profile protects v_first.
     """
 
     config_groups: dict[str, QuantizationScheme] | None = None
@@ -150,9 +151,11 @@ class QuantizationMixin(HooksMixin):
     observer: dict[str, str] | None = None
     bypass_divisibility_checks: bool = False
     target_policy: Literal["rwkv7"] | None = None
-    target_policy_profile: Literal["critical-high", "v-first-dataflow"] = (
-        "critical-high"
-    )
+    target_policy_profile: Literal[
+        "critical-high",
+        "v-first-dataflow",
+        "low-rank-w8-critical-high",
+    ] = "critical-high"
     target_policy_metadata: QuantizationTargetPolicyMetadata | None = None
 
     _calibration_hooks: set[RemovableHandle] = PrivateAttr(default_factory=set)

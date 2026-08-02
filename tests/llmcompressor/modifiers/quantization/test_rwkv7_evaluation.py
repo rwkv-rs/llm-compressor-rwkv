@@ -21,7 +21,7 @@ _CANDIDATES = [
     "nvfp4-w4a4",
     "nvfp4-w4a16",
     "nvfp4-w4a16-protection-ablation",
-    "w8a16-critical-high",
+    "w8a16-low-rank-critical-high",
 ]
 
 
@@ -161,7 +161,15 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict]:
             72.0,
             2.0,
         ),
-        "w8a16-critical-high": ("5" * 64, 300, 0.98, 250, 10.0, 80.0, -999.0),
+        "w8a16-low-rank-critical-high": (
+            "5" * 64,
+            300,
+            0.98,
+            250,
+            10.0,
+            80.0,
+            -999.0,
+        ),
     }
     artifact_refs = {}
     for candidate, values in candidate_values.items():
@@ -275,7 +283,9 @@ def test_builds_traceable_formal_pareto_without_using_evalscope_for_selection(
     assert report["formal_checkpoint"] is True
     assert report["formal_evaluation"] is True
     assert report["diagnostic_tiny"] is False
-    assert report["pareto"]["selected_candidate"] == "w8a16-critical-high"
+    assert report["pareto"]["selected_candidate"] == (
+        "w8a16-low-rank-critical-high"
+    )
     assert report["pareto"]["evalscope_used_for_selection"] is False
     assert report["pareto"]["quality_eligible"] == _CANDIDATES
     assert [row["variant"] for row in report["variants"]] == [

@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
             "nvfp4-w4a4",
             "nvfp4-w4a16",
             "nvfp4-w4a16-protection-ablation",
-            "w8a16-critical-high",
+            "w8a16-low-rank-critical-high",
         ),
         required=True,
     )

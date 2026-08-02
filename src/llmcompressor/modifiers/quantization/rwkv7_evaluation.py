@@ -28,7 +28,7 @@ _CANDIDATES = [
     "nvfp4-w4a4",
     "nvfp4-w4a16",
     "nvfp4-w4a16-protection-ablation",
-    "w8a16-critical-high",
+    "w8a16-low-rank-critical-high",
 ]
 _VARIANTS = ["baseline-bf16", *_CANDIDATES]
 _SELECTION_METRICS = {

@@ -294,13 +294,13 @@ def _tiny_standard_rwkv7():
             "v-first-dataflow",
         ),
         (
-            "w8a16-critical-high",
+            "w8a16-low-rank-critical-high",
             "INT8",
             "int8",
             128,
             "float16",
             "none",
-            "critical-high",
+            "low-rank-w8-critical-high",
         ),
     ],
 )
@@ -323,7 +323,7 @@ def test_tiny_standard_rwkv7_builds_closed_candidate_recipe(
         "nvfp4-w4a4",
         "nvfp4-w4a16",
         "nvfp4-w4a16-protection-ablation",
-        "w8a16-critical-high",
+        "w8a16-low-rank-critical-high",
     ]
     assert loader.algorithm == algorithm
     assert loader.weight_dtype == weight_dtype
@@ -373,6 +373,48 @@ def test_protection_ablation_quantizes_non_value_timemix_but_keeps_v_first(
     }
     assert "model.blocks.1.att.v0" in protected_tensors
     assert "model.blocks.1.att.v2" in protected_tensors
+
+
+@pytest.mark.unit
+def test_low_rank_w8_selects_wag_parameters_but_protects_v_first(
+    real_rwkv7_types,
+):
+    modifier = build_rwkv7_quantization_recipe(
+        _tiny_standard_rwkv7(),
+        "w8a16-low-rank-critical-high",
+    )
+    metadata = modifier.target_policy_metadata
+
+    assert metadata.parameter_selection is not None
+    assert metadata.parameter_selection.kind == "tensor"
+    assert metadata.parameter_selection.names == [
+        f"model.blocks.{layer}.att.{name}"
+        for layer in range(2)
+        for name in ("w1", "w2", "a1", "a2", "g1", "g2")
+    ]
+    assert not any(
+        name.endswith((".v0", ".v1", ".v2"))
+        for name in metadata.parameter_selection.names
+    )
+    protected_modules = {
+        name
+        for decision in metadata.protections
+        if decision.kind == "module"
+        for name in decision.names
+    }
+    protected_tensors = {
+        name
+        for decision in metadata.protections
+        if decision.kind == "tensor"
+        for name in decision.names
+    }
+    assert "model.blocks.0.att.value" in protected_modules
+    assert {
+        "model.blocks.1.att.v0",
+        "model.blocks.1.att.v1",
+        "model.blocks.1.att.v2",
+    } <= protected_tensors
+    assert metadata.recipe.low_rank_weight_dtype == "int8"
 
 
 @pytest.mark.unit
