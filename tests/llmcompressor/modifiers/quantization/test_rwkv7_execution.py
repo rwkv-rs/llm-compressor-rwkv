@@ -248,12 +248,14 @@ def test_nvfp4_w4a16_oneshot_save_and_fresh_direct_class_load(
     except RuntimeError as error:
         pytest.skip(f"requires the product-pinned Transformers revision: {error}")
 
+    checkpoint_contract = RWKV7CheckpointContract()
     model, metadata = quantize_rwkv7_oneshot(
         lambda: _model("cpu"),
         tmp_path,
         calibration_dataset=None,
         processor=None,
         forced_candidate="nvfp4-w4a16",
+        checkpoint_contract=checkpoint_contract,
         fresh_reload_mode="load-only",
         fresh_reload_device="cpu",
     )
@@ -262,10 +264,18 @@ def test_nvfp4_w4a16_oneshot_save_and_fresh_direct_class_load(
     assert artifact_path.joinpath("model.safetensors").is_file()
     assert metadata["candidate"] == "nvfp4-w4a16"
     assert metadata["quantization_applied"] is True
+    assert metadata["formal_runtime_generation"] is False
     assert metadata["provenance_scope"] == "serialization-only"
     assert metadata["artifact_contract"]["runtime_provenance"] == (
         observed_transformers
     )
+    serialized_checkpoint = metadata["artifact_contract"]["checkpoint"]
+    assert serialized_checkpoint["model_id"]
+    assert serialized_checkpoint["repository"]
+    assert serialized_checkpoint["revision"]
+    assert serialized_checkpoint["filename"]
+    assert serialized_checkpoint["sha256"]
+    assert serialized_checkpoint == checkpoint_contract.model_dump(mode="json")
     assert metadata["audit"]["format"] == "nvfp4-pack-quantized"
     assert metadata["audit"]["input_quantized"] is False
     assert metadata["audit"]["legacy_weight_aliases"] == []
