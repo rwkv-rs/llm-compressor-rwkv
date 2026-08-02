@@ -20,9 +20,11 @@ from llmcompressor.modifiers.quantization.rwkv7 import (
     _fresh_reload_generate_script,
     _load_calibration_records,
     _prepare_standard_rwkv7_checkpoint,
+    _snapshot_rwkv7_protected_parameters,
     _validate_native_rwkv7_config,
     _validate_native_rwkv7_runtime,
     _validate_rwkv7_loading_info,
+    _verify_rwkv7_protected_parameters,
     audit_rwkv7_quantized_checkpoint,
     build_rwkv7_artifact_contract,
     build_rwkv7_quantization_recipe,
@@ -728,6 +730,28 @@ def test_w4a16_artifact_declares_exact_vllm_capability_and_target_schema(
         assert contract.vllm.quantized_modules[9] == "model.blocks.1.att.w1"
 
 
+@pytest.mark.unit
+def test_protected_snapshot_rejects_parameter_value_rewrite(monkeypatch):
+    monkeypatch.setattr(
+        rwkv7_module,
+        "validate_rwkv7_transformers_provenance",
+        _runtime_provenance,
+    )
+    model = _tiny_standard_rwkv7().eval()
+    modifier = build_rwkv7_quantization_recipe(model, "nvfp4-w4a16")
+    contract = build_rwkv7_artifact_contract(
+        modifier.target_policy_metadata,
+        "nvfp4-w4a16",
+    )
+    snapshot = _snapshot_rwkv7_protected_parameters(model, contract)
+    layer_norm = model.model.blocks[0].ln1
+    with torch.no_grad():
+        layer_norm.bias.add_(1)
+
+    with pytest.raises(RuntimeError, match="changed a protected tensor value"):
+        _verify_rwkv7_protected_parameters(model, contract, snapshot)
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize(
     "candidate",
@@ -754,6 +778,7 @@ def test_w4a16_real_serializer_preserves_mainstream_config_contract(
         modifier.target_policy_metadata,
         candidate,
     )
+    protected_snapshot = _snapshot_rwkv7_protected_parameters(model, contract)
     resolved_groups = modifier.resolved_config.config_groups
     assert list(resolved_groups) == ["group_0"]
     assert resolved_groups["group_0"].targets == ["Linear"]
@@ -773,6 +798,22 @@ def test_w4a16_real_serializer_preserves_mainstream_config_contract(
     modifier.on_calibration_end(
         state,
         Event(type_=EventType.CALIBRATION_END),
+    )
+    protection_audit = _verify_rwkv7_protected_parameters(
+        model,
+        contract,
+        protected_snapshot,
+    )
+    assert protection_audit["passed"] is True
+    assert protection_audit["module_identity_preserved"] is True
+    assert protection_audit["parameter_ownership_preserved"] is True
+    assert protection_audit["parameter_values_preserved"] is True
+    assert protection_audit["parameter_count"] == len(
+        contract.vllm.protected_parameter_keys
+    )
+    assert all(
+        getattr(model.get_submodule(name), "quantization_scheme", None) is not None
+        for name in contract.vllm.quantized_modules
     )
 
     artifact_path = tmp_path / candidate
@@ -795,9 +836,75 @@ def test_w4a16_real_serializer_preserves_mainstream_config_contract(
         contract.vllm.quantized_modules,
         candidate,
         contract,
+        expected_protected_parameter_sha256=protection_audit["parameter_sha256"],
     )
     assert audit["targets"] == contract.vllm.quantized_modules
     assert audit["tensor_count"] == audit["expected_tensor_count"]
+    assert audit["legacy_weight_aliases"] == []
+    assert audit["protected_parameter_values_verified"] is True
+
+    if candidate == "nvfp4-w4a16":
+        fresh_process = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _fresh_reload_generate_script(),
+                str(artifact_path),
+                "20260801",
+                "[1, 2, 3, 4]",
+                "1",
+                "1",
+                "1",
+                "load-only",
+                "cpu",
+                json.dumps(protection_audit["parameter_sha256"], sort_keys=True),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert fresh_process.returncode == 0, fresh_process.stderr
+        load_evidence = json.loads(fresh_process.stdout.strip().splitlines()[-1])
+        assert load_evidence["execution_mode"] == "load-only"
+        assert load_evidence["artifact_contract_validated"] is True
+        assert load_evidence["transformers_provenance"] is None
+        assert load_evidence["standard_generate"] == {
+            "passed": False,
+            "executed": False,
+        }
+        strict_load = load_evidence["standard_linear_load"]
+        assert strict_load["loader"] == "Rwkv7ForCausalLM.from_pretrained"
+        assert strict_load["config_class"] == "Rwkv7Config"
+        assert strict_load["model_class"] == "Rwkv7ForCausalLM"
+        assert strict_load["trust_remote_code"] is False
+        assert strict_load["strict_loading_info"] is True
+        assert strict_load["runtime_float_weights_restored"] is True
+        assert strict_load["protected_parameter_values_verified"] is True
+        assert strict_load["vllm_metadata_validated"] is True
+        assert strict_load["quantized_scheme_count"] == len(
+            contract.vllm.quantized_modules
+        )
+        assert strict_load["protected_parameter_count"] == len(
+            contract.vllm.protected_parameter_keys
+        )
+
+        from safetensors.torch import load_file, save_file
+
+        protected_name = "model.blocks.0.ln1.bias"
+        shard = artifact_path / "model.safetensors"
+        tensors = load_file(shard)
+        tensors[protected_name] = tensors[protected_name].clone()
+        tensors[protected_name].view(-1)[0] += 1
+        save_file(tensors, shard)
+        with pytest.raises(RuntimeError, match="protected tensor values drifted"):
+            audit_rwkv7_quantized_checkpoint(
+                artifact_path,
+                contract.vllm.quantized_modules,
+                candidate,
+                contract,
+                expected_protected_parameter_sha256=(
+                    protection_audit["parameter_sha256"]
+                ),
+            )
 
 
 @pytest.fixture

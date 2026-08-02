@@ -15,6 +15,7 @@ from llmcompressor.modifiers.quantization.rwkv7 import (
     RWKV7CheckpointContract,
     RWKV7TransformersProvenance,
     _fresh_reload_generate_script,
+    _installed_transformers_provenance,
     quantize_rwkv7_oneshot,
 )
 
@@ -120,7 +121,7 @@ def test_execution_falls_back_only_in_closed_order(tmp_path, monkeypatch):
     monkeypatch.setattr("llmcompressor.oneshot", oneshot)
     monkeypatch.setattr(
         "llmcompressor.modifiers.quantization.rwkv7.audit_rwkv7_quantized_checkpoint",
-        lambda *args: {"format": "nvfp4-pack-quantized"},
+        lambda *args, **kwargs: {"format": "nvfp4-pack-quantized"},
     )
     monkeypatch.setattr(
         "llmcompressor.modifiers.quantization.rwkv7."
@@ -129,7 +130,11 @@ def test_execution_falls_back_only_in_closed_order(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "subprocess.run",
-        lambda *args, **kwargs: SimpleNamespace(returncode=1, stderr="reload blocked"),
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="reload blocked",
+        ),
     )
     _, metadata = quantize_rwkv7_oneshot(
         lambda: _model("cpu"),
@@ -150,7 +155,7 @@ def test_formal_execution_rejects_a_failed_fresh_process_reload(tmp_path, monkey
     monkeypatch.setattr("llmcompressor.oneshot", lambda *, model, **kwargs: model)
     monkeypatch.setattr(
         "llmcompressor.modifiers.quantization.rwkv7.audit_rwkv7_quantized_checkpoint",
-        lambda *args: {"format": "nvfp4-pack-quantized"},
+        lambda *args, **kwargs: {"format": "nvfp4-pack-quantized"},
     )
     monkeypatch.setattr(
         "llmcompressor.modifiers.quantization.rwkv7."
@@ -160,7 +165,9 @@ def test_formal_execution_rejects_a_failed_fresh_process_reload(tmp_path, monkey
     monkeypatch.setattr(
         "subprocess.run",
         lambda *args, **kwargs: SimpleNamespace(
-            returncode=1, stderr="fresh process could not load"
+            returncode=1,
+            stdout="",
+            stderr="fresh process could not load",
         ),
     )
 
@@ -179,6 +186,92 @@ def test_formal_execution_rejects_a_failed_fresh_process_reload(tmp_path, monkey
     )
     assert evidence["fresh_reload"]["passed"] is False
     assert evidence["failures"][-1]["stage"] == "fresh_reload_generate"
+
+
+@pytest.mark.integration
+def test_nvfp4_w4a16_oneshot_save_and_fresh_direct_class_load(
+    tmp_path,
+    owned_process_tmpdir,
+):
+    model, metadata = quantize_rwkv7_oneshot(
+        lambda: _model("cpu"),
+        tmp_path,
+        calibration_dataset=None,
+        processor=None,
+        forced_candidate="nvfp4-w4a16",
+        fresh_reload_mode="load-only",
+        fresh_reload_device="cpu",
+    )
+
+    artifact_path = tmp_path / "nvfp4-w4a16"
+    assert artifact_path.joinpath("model.safetensors").is_file()
+    assert metadata["candidate"] == "nvfp4-w4a16"
+    assert metadata["quantization_applied"] is True
+    assert metadata["provenance_scope"] == "serialization-only"
+    observed_transformers = _installed_transformers_provenance().model_dump(mode="json")
+    assert metadata["artifact_contract"]["runtime_provenance"] == (
+        observed_transformers
+    )
+    assert metadata["audit"]["format"] == "nvfp4-pack-quantized"
+    assert metadata["audit"]["input_quantized"] is False
+    assert metadata["audit"]["legacy_weight_aliases"] == []
+    assert metadata["audit"]["protected_parameter_values_verified"] is True
+    assert metadata["audit"]["operator_runtime_provenance_required"] is False
+    protection_audit = metadata["protection_audit"]
+    assert protection_audit["passed"] is True
+    assert protection_audit["module_identity_preserved"] is True
+    assert protection_audit["parameter_ownership_preserved"] is True
+    assert protection_audit["parameter_values_preserved"] is True
+    assert protection_audit["parameter_count"] == len(
+        protection_audit["parameter_sha256"]
+    )
+    assert metadata["fresh_reload"]["passed"] is True
+    assert metadata["fresh_reload"]["mode"] == "load-only"
+    assert metadata["fresh_reload"]["device"] == "cpu"
+    fresh_evidence = metadata["fresh_reload"]["evidence"]
+    assert fresh_evidence["execution_mode"] == "load-only"
+    assert fresh_evidence["standard_generate"] == {
+        "passed": False,
+        "executed": False,
+    }
+    strict_load = fresh_evidence["standard_linear_load"]
+    assert strict_load["loader"] == "Rwkv7ForCausalLM.from_pretrained"
+    assert strict_load["strict_loading_info"] is True
+    assert strict_load["runtime_float_weights_restored"] is True
+    assert strict_load["protected_parameter_values_verified"] is True
+    assert strict_load["vllm_metadata_validated"] is True
+    assert strict_load["quantized_scheme_count"] == 4
+    assert all(
+        getattr(model.get_submodule(name), "quantization_scheme", None) is not None
+        for name in metadata["artifact_contract"]["vllm"]["quantized_modules"]
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"fresh_reload_mode": "metadata-only"}, "fresh reload mode"),
+        ({"fresh_reload_device": "cuda:any"}, "fresh reload device"),
+        (
+            {
+                "checkpoint_contract": RWKV7CheckpointContract(),
+                "fresh_reload_mode": "load-only",
+            },
+            "formal RWKV-7 checkpoint execution requires fresh forward/generate",
+        ),
+    ],
+)
+def test_execution_rejects_invalid_fresh_process_boundary(tmp_path, kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        quantize_rwkv7_oneshot(
+            lambda: pytest.fail("validation must run before model construction"),
+            tmp_path,
+            calibration_dataset=None,
+            processor=None,
+            forced_candidate="nvfp4-w4a16",
+            **kwargs,
+        )
 
 
 @pytest.mark.skipif(

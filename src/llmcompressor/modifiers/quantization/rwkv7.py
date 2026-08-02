@@ -1069,10 +1069,22 @@ def build_rwkv7_artifact_contract(
     candidate: str,
     *,
     checkpoint: RWKV7CheckpointContract | None = None,
+    serialization_only_provenance: RWKV7TransformersProvenance | None = None,
 ) -> RWKV7ArtifactContract:
     """Resolve the exact standard-HF names protected at the runtime boundary."""
 
-    runtime_provenance = validate_rwkv7_transformers_provenance()
+    if serialization_only_provenance is None:
+        runtime_provenance = validate_rwkv7_transformers_provenance()
+    else:
+        if checkpoint is not None:
+            raise ValueError(
+                "formal RWKV-7 artifacts require operator-runtime provenance"
+            )
+        runtime_provenance = _installed_transformers_provenance()
+        if serialization_only_provenance != runtime_provenance:
+            raise RuntimeError(
+                "RWKV-7 serialization provenance differs from the active checkout"
+            )
     if candidate not in _CANDIDATE_SCHEMES:
         raise ValueError(f"unsupported RWKV-7 candidate for artifact: {candidate}")
     if target_policy.recipe is None or target_policy.recipe.candidate != candidate:
@@ -1316,27 +1328,13 @@ def _validate_candidate_scheme(
     )
 
 
-def build_rwkv7_quantization_recipe(
+def _build_rwkv7_quantization_recipe(
     model: torch.nn.Module,
-    candidate: str = "nvfp4-w4a4",
+    candidate: str,
     *,
-    framework_versions: dict[str, str] | None = None,
+    framework_versions: dict[str, str],
+    runtime_provenance: RWKV7TransformersProvenance,
 ):
-    """Build one validated closed-set recipe without applying quantization."""
-
-    if candidate not in _CANDIDATE_SCHEMES:
-        raise ValueError(
-            f"unsupported RWKV-7 quantization candidate {candidate!r}; "
-            f"allowed={list(_CANDIDATE_SCHEMES)}"
-        )
-    versions = (
-        _installed_framework_versions()
-        if framework_versions is None
-        else dict(framework_versions)
-    )
-    _validate_framework_versions(versions)
-    runtime_provenance = validate_rwkv7_transformers_provenance()
-
     from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
 
     from llmcompressor.modifiers.quantization import QuantizationModifier
@@ -1369,7 +1367,7 @@ def build_rwkv7_quantization_recipe(
         candidate,
         next(iter(modifier.resolved_config.config_groups.values())),
         targets=list(modifier.target_policy_metadata.selection.names),
-        framework_versions=versions,
+        framework_versions=framework_versions,
         runtime_provenance=runtime_provenance,
     )
     if (
@@ -1381,6 +1379,33 @@ def build_rwkv7_quantization_recipe(
         update={"recipe": recipe_metadata}
     )
     return modifier
+
+
+def build_rwkv7_quantization_recipe(
+    model: torch.nn.Module,
+    candidate: str = "nvfp4-w4a4",
+    *,
+    framework_versions: dict[str, str] | None = None,
+):
+    """Build one operator-runtime validated closed-set quantization recipe."""
+
+    if candidate not in _CANDIDATE_SCHEMES:
+        raise ValueError(
+            f"unsupported RWKV-7 quantization candidate {candidate!r}; "
+            f"allowed={list(_CANDIDATE_SCHEMES)}"
+        )
+    versions = (
+        _installed_framework_versions()
+        if framework_versions is None
+        else dict(framework_versions)
+    )
+    _validate_framework_versions(versions)
+    return _build_rwkv7_quantization_recipe(
+        model,
+        candidate,
+        framework_versions=versions,
+        runtime_provenance=validate_rwkv7_transformers_provenance(),
+    )
 
 
 def _load_rwkv7_artifact_contract(output_dir: Path) -> RWKV7ArtifactContract:
@@ -1535,11 +1560,222 @@ def _tensor_owners(tensors: dict[str, tuple[list[int], str]], suffix: str) -> se
     return {name.removesuffix(suffix) for name in tensors if name.endswith(suffix)}
 
 
+def _tensor_sha256(tensor: torch.Tensor) -> str:
+    """Hash tensor storage without retaining a second full-size model copy."""
+
+    digest = hashlib.sha256()
+    flat = tensor.detach().reshape(-1)
+    chunk_elements = max(1, (8 * 1024 * 1024) // max(1, flat.element_size()))
+    for start in range(0, flat.numel(), chunk_elements):
+        chunk = flat[start : start + chunk_elements]
+        byte_view = chunk.contiguous().view(torch.uint8).cpu()
+        digest.update(byte_view.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _validate_rwkv7_artifact_model_ownership(
+    model: torch.nn.Module,
+    contract: RWKV7ArtifactContract,
+) -> dict[str, int]:
+    """Resolve every artifact inventory entry against standard module ownership."""
+
+    _resolve_standard_base_model(model)
+
+    def require_module(
+        name: str,
+        expected_type: type[torch.nn.Module] | tuple[type[torch.nn.Module], ...],
+    ) -> torch.nn.Module:
+        try:
+            module = model.get_submodule(name)
+        except AttributeError as error:
+            raise RuntimeError(
+                f"RWKV-7 artifact metadata references a missing module: {name}"
+            ) from error
+        if not isinstance(module, expected_type):
+            expected_names = (
+                expected_type.__name__
+                if isinstance(expected_type, type)
+                else "/".join(item.__name__ for item in expected_type)
+            )
+            raise RuntimeError(
+                "RWKV-7 artifact module ownership drifted: "
+                f"name={name} expected={expected_names} "
+                f"actual={type(module).__name__}"
+            )
+        return module
+
+    for name in contract.vllm.quantized_modules:
+        require_module(name, torch.nn.Linear)
+    for name in contract.vllm.protected_linear_modules:
+        require_module(name, torch.nn.Linear)
+    for name in contract.vllm.protected_embedding_modules:
+        require_module(name, torch.nn.Embedding)
+    for name in contract.vllm.protected_normalization_modules:
+        require_module(name, (torch.nn.LayerNorm, torch.nn.GroupNorm))
+    for name in contract.vllm.protected_state_tensors:
+        try:
+            parameter = model.get_parameter(name)
+        except AttributeError as error:
+            raise RuntimeError(
+                f"RWKV-7 artifact metadata references a missing state tensor: {name}"
+            ) from error
+        if not isinstance(parameter, torch.nn.Parameter):
+            raise RuntimeError(
+                f"RWKV-7 protected state tensor is not a Parameter: {name}"
+            )
+
+    return {
+        "quantized_linear_module_count": len(contract.vllm.quantized_modules),
+        "protected_linear_module_count": len(contract.vllm.protected_linear_modules),
+        "protected_embedding_module_count": len(
+            contract.vllm.protected_embedding_modules
+        ),
+        "protected_normalization_module_count": len(
+            contract.vllm.protected_normalization_modules
+        ),
+        "protected_state_tensor_count": len(contract.vllm.protected_state_tensors),
+    }
+
+
+def _snapshot_rwkv7_protected_parameters(
+    model: torch.nn.Module,
+    contract: RWKV7ArtifactContract,
+) -> dict[str, dict[str, Any]]:
+    """Capture exact protected values and ownership before quantization."""
+
+    _validate_rwkv7_artifact_model_ownership(model, contract)
+    snapshot = {}
+    for name in contract.vllm.protected_parameter_keys:
+        parameter = model.get_parameter(name)
+        owner = model.get_submodule(name.rsplit(".", 1)[0])
+        snapshot[name] = {
+            "owner_id": id(owner),
+            "shape": list(parameter.shape),
+            "dtype": str(parameter.dtype),
+            "sha256": _tensor_sha256(parameter),
+        }
+    return snapshot
+
+
+def _verify_rwkv7_protected_parameters(
+    model: torch.nn.Module,
+    contract: RWKV7ArtifactContract,
+    snapshot: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Fail if quantization changes protected ownership, shape, dtype, or value."""
+
+    _validate_rwkv7_artifact_model_ownership(model, contract)
+    expected_names = set(contract.vllm.protected_parameter_keys)
+    if set(snapshot) != expected_names:
+        raise RuntimeError(
+            "RWKV-7 protected snapshot differs from the artifact inventory"
+        )
+    sha256 = {}
+    for name in contract.vllm.protected_parameter_keys:
+        expected = snapshot[name]
+        parameter = model.get_parameter(name)
+        owner = model.get_submodule(name.rsplit(".", 1)[0])
+        if id(owner) != expected.get("owner_id"):
+            raise RuntimeError(
+                f"RWKV-7 quantization replaced a protected module: {name}"
+            )
+        if list(parameter.shape) != expected.get("shape"):
+            raise RuntimeError(
+                f"RWKV-7 quantization changed a protected tensor shape: {name}"
+            )
+        if str(parameter.dtype) != expected.get("dtype"):
+            raise RuntimeError(
+                f"RWKV-7 quantization changed a protected tensor dtype: {name}"
+            )
+        actual_sha256 = _tensor_sha256(parameter)
+        if actual_sha256 != expected.get("sha256"):
+            raise RuntimeError(
+                f"RWKV-7 quantization changed a protected tensor value: {name}"
+            )
+        sha256[name] = actual_sha256
+    return {
+        "passed": True,
+        "parameter_count": len(sha256),
+        "module_identity_preserved": True,
+        "parameter_ownership_preserved": True,
+        "parameter_values_preserved": True,
+        "parameter_sha256": sha256,
+    }
+
+
+def _validate_loaded_rwkv7_artifact_ownership(
+    model: torch.nn.Module,
+    contract: RWKV7ArtifactContract,
+    runtime_dtype: torch.dtype,
+    expected_protected_parameter_sha256: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Validate the public dequantized Transformers ownership boundary."""
+
+    inventory = _validate_rwkv7_artifact_model_ownership(model, contract)
+    quantized = [model.get_submodule(name) for name in contract.vllm.quantized_modules]
+    protected = [model.get_submodule(name) for name in contract.vllm.protected_modules]
+    protected_parameters = [
+        model.get_parameter(name) for name in contract.vllm.protected_parameter_keys
+    ]
+    if not all(
+        getattr(module, "quantization_scheme", None) is not None for module in quantized
+    ):
+        raise RuntimeError("RWKV-7 loaded target lacks its quantization scheme")
+    if not all(
+        isinstance(getattr(module, "weight", None), torch.nn.Parameter)
+        and module.weight.is_floating_point()
+        and module.weight.dtype == runtime_dtype
+        for module in quantized
+    ):
+        raise RuntimeError(
+            "RWKV-7 public dequantization did not restore standard float weights"
+        )
+    if not all(
+        getattr(module, "quantization_scheme", None) is None for module in protected
+    ):
+        raise RuntimeError("RWKV-7 protected module acquired a quantization scheme")
+    if not all(parameter.dtype == runtime_dtype for parameter in protected_parameters):
+        raise RuntimeError("RWKV-7 protected parameter has the wrong runtime dtype")
+    protected_parameter_sha256 = {
+        name: _tensor_sha256(model.get_parameter(name))
+        for name in contract.vllm.protected_parameter_keys
+    }
+    if expected_protected_parameter_sha256 is not None:
+        if set(expected_protected_parameter_sha256) != set(
+            contract.vllm.protected_parameter_keys
+        ):
+            raise RuntimeError(
+                "RWKV-7 fresh-load protected digest inventory differs from metadata"
+            )
+        mismatched = sorted(
+            name
+            for name, expected in expected_protected_parameter_sha256.items()
+            if protected_parameter_sha256[name] != expected
+        )
+        if mismatched:
+            raise RuntimeError(
+                f"RWKV-7 fresh load changed protected tensor values: {mismatched}"
+            )
+    return {
+        **inventory,
+        "runtime_float_weights_restored": True,
+        "quantized_scheme_count": len(quantized),
+        "protected_parameter_count": len(protected_parameters),
+        "protected_parameter_values_verified": (
+            expected_protected_parameter_sha256 is not None
+        ),
+        "vllm_metadata_validated": True,
+    }
+
+
 def audit_rwkv7_quantized_checkpoint(
     output_dir: Path,
     expected_targets: list[str],
     candidate: str,
     artifact_contract: RWKV7ArtifactContract | None = None,
+    *,
+    expected_protected_parameter_sha256: Mapping[str, str] | None = None,
+    require_operator_runtime_provenance: bool = True,
 ) -> dict[str, Any]:
     """Verify compressed tensor storage, not merely serialized recipe metadata."""
     from safetensors import safe_open
@@ -1553,8 +1789,10 @@ def audit_rwkv7_quantized_checkpoint(
     loaded_contract = _load_rwkv7_artifact_contract(output_dir)
     if artifact_contract is not None and loaded_contract != artifact_contract:
         raise RuntimeError("RWKV-7 serialized artifact contract drifted")
-    transformers_provenance = validate_rwkv7_transformers_provenance(
-        loaded_contract.repository
+    transformers_provenance = (
+        validate_rwkv7_transformers_provenance(loaded_contract.repository)
+        if require_operator_runtime_provenance
+        else _installed_transformers_provenance()
     )
     if transformers_provenance != loaded_contract.runtime_provenance:
         raise RuntimeError(
@@ -1627,6 +1865,7 @@ def audit_rwkv7_quantized_checkpoint(
             "RWKV-7 checkpoint activation quantization differs from candidate"
         )
     tensors: dict[str, tuple[list[int], str]] = {}
+    protected_parameter_sha256 = {}
     for shard in sorted(output_dir.glob("*.safetensors")):
         with safe_open(shard, framework="pt", device="cpu") as handle:
             for name in handle.keys():
@@ -1638,6 +1877,13 @@ def audit_rwkv7_quantized_checkpoint(
                     handle.get_slice(name).get_shape(),
                     handle.get_slice(name).get_dtype(),
                 )
+                if (
+                    expected_protected_parameter_sha256 is not None
+                    and name in expected_protected_parameter_sha256
+                ):
+                    protected_parameter_sha256[name] = _tensor_sha256(
+                        handle.get_tensor(name)
+                    )
     expected_target_set = set(expected_targets)
     expected_tensor_owners = {
         ".weight_packed": expected_target_set,
@@ -1717,6 +1963,21 @@ def audit_rwkv7_quantized_checkpoint(
             "RWKV-7 artifact is missing protected physical tensors: "
             f"{missing_protected}"
         )
+    if expected_protected_parameter_sha256 is not None:
+        if set(expected_protected_parameter_sha256) != protected_names:
+            raise RuntimeError(
+                "RWKV-7 protected digest inventory differs from artifact metadata"
+            )
+        mismatched_protected = sorted(
+            name
+            for name, expected_sha256 in expected_protected_parameter_sha256.items()
+            if protected_parameter_sha256.get(name) != expected_sha256
+        )
+        if mismatched_protected:
+            raise RuntimeError(
+                "RWKV-7 serialized protected tensor values drifted: "
+                f"{mismatched_protected}"
+            )
     for name in loaded_contract.vllm.protected_modules:
         if any(key.startswith(f"{name}.weight_") for key in tensors):
             raise RuntimeError(f"RWKV-7 protected module was compressed: {name}")
@@ -1738,11 +1999,15 @@ def audit_rwkv7_quantized_checkpoint(
         "targets": expected_targets,
         "quantized_weight_names": [f"{name}.weight" for name in expected_targets],
         "protected_parameter_count": len(protected_names),
+        "protected_parameter_values_verified": (
+            expected_protected_parameter_sha256 is not None
+        ),
         "tensor_count": len(tensors),
         "expected_tensor_count": len(expected_tensor_keys),
         "input_quantized": input_quantized,
         "artifact_contract_serialized": True,
         "transformers_provenance": transformers_provenance.model_dump(mode="json"),
+        "operator_runtime_provenance_required": require_operator_runtime_provenance,
         "standard_linear_ownership": True,
         "legacy_weight_aliases": legacy_weight_aliases,
     }
@@ -1772,6 +2037,7 @@ import json, math, statistics, sys, time, torch
 from llmcompressor.modifiers.quantization.rwkv7 import (
     RWKV7ArtifactContract,
     RWKV7RepositoryContract,
+    _validate_loaded_rwkv7_artifact_ownership,
     _validate_native_rwkv7_config,
     _validate_native_rwkv7_runtime,
     _validate_rwkv7_loading_info,
@@ -1787,32 +2053,41 @@ with open(f'{sys.argv[1]}/config.json', encoding='utf-8') as config_handle:
 _validate_native_rwkv7_config(serialized_config)
 serialized_contract = serialized_config['rwkv7_quantization_metadata']
 contract_model = RWKV7ArtifactContract.model_validate(serialized_contract)
-transformers_provenance = validate_rwkv7_transformers_provenance(
-    RWKV7RepositoryContract.model_validate(contract_model.repository)
-)
-if transformers_provenance != contract_model.runtime_provenance:
-    raise RuntimeError(
-        'RWKV-7 serialized runtime provenance differs from the active runtime'
-    )
-transformers_provenance = transformers_provenance.model_dump(mode='json')
 contract = contract_model.model_dump(mode='json')
 
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import Rwkv7Config
+from transformers.models.rwkv7 import Rwkv7ForCausalLM
 from transformers.utils.quantization_config import CompressedTensorsConfig
 
-config = AutoConfig.from_pretrained(sys.argv[1], trust_remote_code=False)
+config = Rwkv7Config.from_pretrained(sys.argv[1], trust_remote_code=False)
 generate_seed = int(sys.argv[2])
 prompt_ids = json.loads(sys.argv[3])
 max_new_tokens = int(sys.argv[4])
 warmup_runs = int(sys.argv[5])
 timed_runs = int(sys.argv[6])
+execution_mode = sys.argv[7] if len(sys.argv) > 7 else 'forward-generate'
+runtime_device = sys.argv[8] if len(sys.argv) > 8 else 'cuda'
+protected_parameter_sha256 = (
+    json.loads(sys.argv[9]) if len(sys.argv) > 9 else None
+)
+require(
+    execution_mode in ('load-only', 'forward-generate'),
+    'execution mode must be load-only or forward-generate',
+)
+require(
+    runtime_device in ('cpu', 'cuda') or (
+        runtime_device.startswith('cuda:')
+        and runtime_device.removeprefix('cuda:').isdigit()
+    ),
+    'runtime device must be cpu or cuda',
+)
 runtime_dtype = config.dtype
 require(isinstance(runtime_dtype, torch.dtype), 'config dtype is not torch.dtype')
 require(warmup_runs >= 1, 'warmup_runs must be at least one')
 require(timed_runs >= 1, 'timed_runs must be at least one')
 require(
     getattr(config, 'rwkv7_quantization_metadata', None) == contract,
-    'AutoConfig metadata differs from the serialized artifact contract',
+    'Rwkv7Config metadata differs from the serialized artifact contract',
 )
 require(contract['schema_version'] == 3, 'artifact schema_version must be 3')
 require(
@@ -1851,12 +2126,17 @@ require(
     'protected v_first modules overlap the quantized inventory',
 )
 
-torch.cuda.reset_peak_memory_stats()
-torch.cuda.synchronize()
+is_cuda = runtime_device.startswith('cuda')
+cuda_device = torch.device(runtime_device) if is_cuda else None
+if is_cuda:
+    require(torch.cuda.is_available(), 'CUDA execution requested but unavailable')
+    torch.cuda.reset_peak_memory_stats(cuda_device)
+    torch.cuda.synchronize(cuda_device)
 load_started = time.perf_counter()
-model, loading_info = AutoModelForCausalLM.from_pretrained(
+model, loading_info = Rwkv7ForCausalLM.from_pretrained(
     sys.argv[1],
-    device_map='cuda',
+    config=config,
+    device_map=runtime_device,
     dtype=runtime_dtype,
     quantization_config=CompressedTensorsConfig(dequantize=True),
     output_loading_info=True,
@@ -1866,51 +2146,77 @@ _validate_native_rwkv7_runtime(config, model)
 _validate_rwkv7_loading_info(loading_info)
 missing_quantized_weights = []
 model = model.to(dtype=runtime_dtype).eval()
-torch.cuda.synchronize()
+if is_cuda:
+    torch.cuda.synchronize(cuda_device)
 load_latency_ms = (time.perf_counter() - load_started) * 1000.0
-load_peak_allocated_bytes = torch.cuda.max_memory_allocated()
-load_peak_reserved_bytes = torch.cuda.max_memory_reserved()
-model_resident_allocated_bytes = torch.cuda.memory_allocated()
-model_resident_reserved_bytes = torch.cuda.memory_reserved()
-
-quantized = [
-    model.get_submodule(name) for name in contract['vllm']['quantized_modules']
-]
-protected = [
-    model.get_submodule(name) for name in contract['vllm']['protected_modules']
-]
-protected_parameters = [
-    model.get_parameter(name)
-    for name in contract['vllm']['protected_parameter_keys']
-]
-require(
-    all(
-        getattr(module, 'quantization_scheme', None) is not None
-        for module in quantized
+load_peak_allocated_bytes = (
+    torch.cuda.max_memory_allocated(cuda_device) if is_cuda else None
+)
+load_peak_reserved_bytes = (
+    torch.cuda.max_memory_reserved(cuda_device) if is_cuda else None
+)
+model_resident_allocated_bytes = (
+    torch.cuda.memory_allocated(cuda_device) if is_cuda else None
+)
+model_resident_reserved_bytes = (
+    torch.cuda.memory_reserved(cuda_device) if is_cuda else None
+)
+ownership = _validate_loaded_rwkv7_artifact_ownership(
+    model,
+    contract_model,
+    runtime_dtype,
+    protected_parameter_sha256,
+)
+load_evidence = {
+    'passed': True,
+    'loader': 'Rwkv7ForCausalLM.from_pretrained',
+    'config_class': type(config).__name__,
+    'model_class': type(model).__name__,
+    'trust_remote_code': False,
+    'strict_loading_info': True,
+    'missing_quantized_weights': missing_quantized_weights,
+    'quantized_low_rank_module_count': len(
+        contract['vllm']['quantized_low_rank_modules']
     ),
-    'a quantized module lacks its quantization scheme',
-)
-require(
-    all(module.weight.dtype == runtime_dtype for module in quantized),
-    'a dequantized target weight has the wrong runtime dtype',
-)
-require(
-    all(
-        getattr(module, 'quantization_scheme', None) is None
-        for module in protected
+    'protected_v_first_linear_module_count': len(
+        contract['vllm']['protected_v_first_linear_modules']
     ),
-    'a protected module unexpectedly has a quantization scheme',
-)
-require(
-    all(module.weight.dtype == runtime_dtype for module in protected),
-    'a protected module weight has the wrong runtime dtype',
-)
-require(
-    all(parameter.dtype == runtime_dtype for parameter in protected_parameters),
-    'a protected physical parameter has the wrong runtime dtype',
-)
+    **ownership,
+}
 
-prompt = torch.tensor([prompt_ids], device='cuda')
+if execution_mode == 'load-only':
+    print(json.dumps({
+        'dtype': str(runtime_dtype),
+        'logits_dtype': None,
+        'quantized_module_count': len(contract['vllm']['quantized_modules']),
+        'protected_module_count': len(contract['vllm']['protected_modules']),
+        'protected_state_tensor_count': len(contract['vllm']['protected_tensors']),
+        'protected_parameter_count': len(
+            contract['vllm']['protected_parameter_keys']
+        ),
+        'artifact_contract_validated': True,
+        'transformers_provenance': None,
+        'execution_mode': execution_mode,
+        'standard_linear_load': load_evidence,
+        'runtime_measurement': {
+            'scope': 'fresh-process-transformers-direct-class-load',
+            'canonical_performance_acceptance': False,
+            'device': runtime_device,
+            'load_latency_ms': load_latency_ms,
+        },
+        'standard_generate': {'passed': False, 'executed': False},
+    }))
+    raise SystemExit(0)
+
+transformers_provenance = validate_rwkv7_transformers_provenance(
+    RWKV7RepositoryContract.model_validate(contract_model.repository)
+)
+if transformers_provenance != contract_model.runtime_provenance:
+    raise RuntimeError(
+        'RWKV-7 serialized runtime provenance differs from the active runtime'
+    )
+transformers_provenance = transformers_provenance.model_dump(mode='json')
+prompt = torch.tensor([prompt_ids], device=runtime_device)
 
 def generate_once():
     torch.manual_seed(generate_seed)
@@ -1929,17 +2235,25 @@ with torch.inference_mode():
     logits = model(prompt).logits
     for _ in range(warmup_runs):
         generate_once()
-    torch.cuda.synchronize()
-    generate_baseline_allocated_bytes = torch.cuda.memory_allocated()
-    generate_baseline_reserved_bytes = torch.cuda.memory_reserved()
-    torch.cuda.reset_peak_memory_stats()
+    if is_cuda:
+        torch.cuda.synchronize(cuda_device)
+    generate_baseline_allocated_bytes = (
+        torch.cuda.memory_allocated(cuda_device) if is_cuda else None
+    )
+    generate_baseline_reserved_bytes = (
+        torch.cuda.memory_reserved(cuda_device) if is_cuda else None
+    )
+    if is_cuda:
+        torch.cuda.reset_peak_memory_stats(cuda_device)
     latencies_ms = []
     generated = None
     for _ in range(timed_runs):
-        torch.cuda.synchronize()
+        if is_cuda:
+            torch.cuda.synchronize(cuda_device)
         generate_started = time.perf_counter()
         generated = generate_once()
-        torch.cuda.synchronize()
+        if is_cuda:
+            torch.cuda.synchronize(cuda_device)
         latencies_ms.append((time.perf_counter() - generate_started) * 1000.0)
 
 require(generated is not None, 'timed generation produced no output')
@@ -1958,27 +2272,23 @@ elapsed_seconds = sum(latencies_ms) / 1000.0
 print(json.dumps({
     'dtype': str(runtime_dtype),
     'logits_dtype': str(logits.dtype),
-    'quantized_module_count': len(quantized),
-    'protected_module_count': len(protected),
+    'quantized_module_count': len(contract['vllm']['quantized_modules']),
+    'protected_module_count': len(contract['vllm']['protected_modules']),
     'protected_state_tensor_count': len(contract['vllm']['protected_tensors']),
-    'protected_parameter_count': len(protected_parameters),
+    'protected_parameter_count': len(contract['vllm']['protected_parameter_keys']),
     'artifact_contract_validated': True,
     'transformers_provenance': transformers_provenance,
-    'standard_linear_load': {
-        'passed': True,
-        'missing_quantized_weights': missing_quantized_weights,
-        'quantized_low_rank_module_count': len(
-            contract['vllm']['quantized_low_rank_modules']
-        ),
-        'protected_v_first_linear_module_count': len(
-            contract['vllm']['protected_v_first_linear_modules']
-        ),
-    },
+    'execution_mode': execution_mode,
+    'standard_linear_load': load_evidence,
     'runtime_measurement': {
         'scope': 'fresh-process-transformers-generate-diagnostic',
         'canonical_performance_acceptance': False,
-        'device_name': torch.cuda.get_device_name(),
-        'device_capability': list(torch.cuda.get_device_capability()),
+        'device_name': (
+            torch.cuda.get_device_name(cuda_device) if is_cuda else 'cpu'
+        ),
+        'device_capability': (
+            list(torch.cuda.get_device_capability(cuda_device)) if is_cuda else None
+        ),
         'load_latency_ms': load_latency_ms,
         'load_peak_allocated_bytes': load_peak_allocated_bytes,
         'load_peak_reserved_bytes': load_peak_reserved_bytes,
@@ -1996,8 +2306,12 @@ print(json.dumps({
             ),
             'baseline_allocated_bytes': generate_baseline_allocated_bytes,
             'baseline_reserved_bytes': generate_baseline_reserved_bytes,
-            'peak_allocated_bytes': torch.cuda.max_memory_allocated(),
-            'peak_reserved_bytes': torch.cuda.max_memory_reserved(),
+            'peak_allocated_bytes': (
+                torch.cuda.max_memory_allocated(cuda_device) if is_cuda else None
+            ),
+            'peak_reserved_bytes': (
+                torch.cuda.max_memory_reserved(cuda_device) if is_cuda else None
+            ),
         },
     },
     'standard_generate': {
@@ -2023,6 +2337,8 @@ def quantize_rwkv7_oneshot(
     checkpoint_contract: RWKV7CheckpointContract | None = None,
     fresh_reload_prompt_ids: list[int] | None = None,
     fresh_reload_new_tokens: int = _FRESH_RELOAD_NEW_TOKENS,
+    fresh_reload_mode: Literal["load-only", "forward-generate"] = "forward-generate",
+    fresh_reload_device: str = "cuda",
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
     """Execute the closed candidate order through standard ``oneshot``."""
     from llmcompressor import oneshot
@@ -2044,19 +2360,58 @@ def quantize_rwkv7_oneshot(
         raise ValueError("fresh reload prompt IDs must be non-empty non-negative ints")
     if fresh_reload_new_tokens < 1:
         raise ValueError("fresh reload must generate at least one token")
+    if fresh_reload_mode not in {"load-only", "forward-generate"}:
+        raise ValueError("fresh reload mode must be load-only or forward-generate")
+    valid_fresh_device = fresh_reload_device in {"cpu", "cuda"} or (
+        fresh_reload_device.startswith("cuda:")
+        and fresh_reload_device.removeprefix("cuda:").isdigit()
+    )
+    if not valid_fresh_device:
+        raise ValueError("fresh reload device must be cpu, cuda, or cuda:N")
+    if checkpoint_contract is not None and fresh_reload_mode != "forward-generate":
+        raise ValueError(
+            "formal RWKV-7 checkpoint execution requires fresh forward/generate"
+        )
     execution_candidates = (
         candidates if forced_candidate is None else (forced_candidate,)
+    )
+    framework_versions = _installed_framework_versions()
+    _validate_framework_versions(framework_versions)
+    serialization_only = fresh_reload_mode == "load-only"
+    runtime_provenance = (
+        _installed_transformers_provenance()
+        if serialization_only
+        else validate_rwkv7_transformers_provenance()
     )
     failures = []
     for candidate in execution_candidates:
         model = model_factory()
-        modifier = build_rwkv7_quantization_recipe(model, candidate)
+        modifier = _build_rwkv7_quantization_recipe(
+            model,
+            candidate,
+            framework_versions=framework_versions,
+            runtime_provenance=runtime_provenance,
+        )
+        artifact_contract = build_rwkv7_artifact_contract(
+            modifier.target_policy_metadata,
+            candidate,
+            checkpoint=checkpoint_contract,
+            serialization_only_provenance=(
+                runtime_provenance if serialization_only else None
+            ),
+        )
+        protected_snapshot = _snapshot_rwkv7_protected_parameters(
+            model,
+            artifact_contract,
+        )
+        quantization_device = next(model.parameters()).device
+        cuda_measured = quantization_device.type == "cuda"
         destination = output_dir / candidate
         destination.mkdir(parents=True, exist_ok=True)
         try:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-                torch.cuda.reset_peak_memory_stats()
+            if cuda_measured:
+                torch.cuda.synchronize(quantization_device)
+                torch.cuda.reset_peak_memory_stats(quantization_device)
             quantization_started = time.perf_counter()
             result = oneshot(
                 model=model,
@@ -2066,25 +2421,25 @@ def quantize_rwkv7_oneshot(
                 pipeline="basic" if candidate == "nvfp4-w4a4" else "datafree",
                 output_dir=None,
             )
-            artifact_contract = build_rwkv7_artifact_contract(
-                modifier.target_policy_metadata,
-                candidate,
-                checkpoint=checkpoint_contract,
+            protection_audit = _verify_rwkv7_protected_parameters(
+                result,
+                artifact_contract,
+                protected_snapshot,
             )
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+            if cuda_measured:
+                torch.cuda.synchronize(quantization_device)
             quantization_runtime = {
                 "scope": "llmcompressor-oneshot",
                 "latency_ms": (time.perf_counter() - quantization_started) * 1000.0,
-                "cuda_measured": torch.cuda.is_available(),
+                "cuda_measured": cuda_measured,
                 "peak_allocated_bytes": (
-                    torch.cuda.max_memory_allocated()
-                    if torch.cuda.is_available()
+                    torch.cuda.max_memory_allocated(quantization_device)
+                    if cuda_measured
                     else None
                 ),
                 "peak_reserved_bytes": (
-                    torch.cuda.max_memory_reserved()
-                    if torch.cuda.is_available()
+                    torch.cuda.max_memory_reserved(quantization_device)
+                    if cuda_measured
                     else None
                 ),
             }
@@ -2127,6 +2482,10 @@ def quantize_rwkv7_oneshot(
                 modifier.target_policy_metadata.selection.names,
                 candidate,
                 artifact_contract,
+                expected_protected_parameter_sha256=(
+                    protection_audit["parameter_sha256"]
+                ),
+                require_operator_runtime_provenance=not serialization_only,
             )
         except Exception as error:
             failures.append(
@@ -2152,6 +2511,9 @@ def quantize_rwkv7_oneshot(
                 str(fresh_reload_new_tokens),
                 str(_FRESH_RELOAD_WARMUP_RUNS),
                 str(_FRESH_RELOAD_TIMED_RUNS),
+                fresh_reload_mode,
+                fresh_reload_device,
+                json.dumps(protection_audit["parameter_sha256"], sort_keys=True),
             ],
             capture_output=True,
             text=True,
@@ -2168,12 +2530,18 @@ def quantize_rwkv7_oneshot(
             "quantization_applied": True,
             "artifact_contract": artifact_contract.model_dump(mode="json"),
             "audit": audit,
+            "protection_audit": protection_audit,
             "cell_forward": {
                 "passed": True,
                 "output_shape": list(cell_output.shape),
                 "state_shape": list(cell_state.shape),
             },
             "quantization_runtime": quantization_runtime,
+            "provenance_scope": (
+                "serialization-only"
+                if serialization_only
+                else "operator-runtime-validated"
+            ),
             "standard_linear_ownership": {
                 "passed": True,
                 "quantized_weight_names": (
@@ -2189,6 +2557,9 @@ def quantize_rwkv7_oneshot(
             "fresh_reload": {
                 "passed": reload_run.returncode == 0,
                 "returncode": reload_run.returncode,
+                "mode": fresh_reload_mode,
+                "device": fresh_reload_device,
+                "stdout": reload_run.stdout[-8000:],
                 "stderr": reload_run.stderr[-8000:],
                 "evidence": reload_evidence,
                 "source_owner": "Transformers RWKV7 loader",
