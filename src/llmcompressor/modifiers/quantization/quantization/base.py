@@ -53,6 +53,12 @@ class QuantizationModifier(Modifier, QuantizationMixin):
         There is an explicit assumption that the model contains modules with
         `k_proj` and `v_proj` in their names. If this is not the case
         and kv_cache_scheme != None, the quantization of kv cache will fail
+    :param target_policy: optional model-specific fail-closed module targeting policy.
+        ``rwkv7`` selects only the standard ChannelMix projections and records its
+        recurrent TimeMix and v_first protections in recipe metadata.
+    :param target_policy_profile: protection profile used by ``rwkv7``. The explicit
+        ``low-rank-w8-critical-high`` profile quantizes standard w/a/g low-rank
+        Linear weights. No profile unprotects v_first.
     """
 
     def on_initialize(self, state: State, **kwargs) -> bool:
