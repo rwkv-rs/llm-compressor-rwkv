@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -81,6 +82,8 @@ _CANDIDATE_SCHEMES = {
 _FRESH_RELOAD_GENERATE_SEED = 20260801
 _FRESH_RELOAD_PROMPT_IDS = [1, 2, 3, 4]
 _FRESH_RELOAD_NEW_TOKENS = 4
+_FRESH_RELOAD_WARMUP_RUNS = 1
+_FRESH_RELOAD_TIMED_RUNS = 3
 _RWKV7_METADATA_KEY = "rwkv7_quantization_metadata"
 _LLM_COMPRESSOR_UPSTREAM_REPOSITORY = (
     "https://github.com/vllm-project/llm-compressor.git"
@@ -543,6 +546,153 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
         Path(temporary_name).unlink(missing_ok=True)
 
 
+def _fresh_reload_generate_script() -> str:
+    """Return the isolated loader/generation program used for formal evidence."""
+
+    return r"""
+import json, math, statistics, sys, time, torch
+from transformers import AutoConfig, AutoModelForCausalLM
+from transformers.utils.quantization_config import CompressedTensorsConfig
+
+config = AutoConfig.from_pretrained(sys.argv[1])
+generate_seed = int(sys.argv[2])
+prompt_ids = json.loads(sys.argv[3])
+max_new_tokens = int(sys.argv[4])
+warmup_runs = int(sys.argv[5])
+timed_runs = int(sys.argv[6])
+runtime_dtype = config.dtype
+assert isinstance(runtime_dtype, torch.dtype)
+assert warmup_runs >= 1
+assert timed_runs >= 1
+contract = getattr(config, 'rwkv7_quantization_metadata')
+assert contract['schema_version'] == 1
+assert contract['candidate'] in (
+    'nvfp4-w4a4',
+    'nvfp4-w4a16',
+    'nvfp4-w4a16-protection-ablation',
+    'w8a16-critical-high',
+)
+assert contract['vllm']['architecture'] == 'Rwkv7ForCausalLM'
+assert contract['vllm']['source_format'] == 'standard_hf'
+assert contract['vllm']['legacy_pth_direct_load'] is False
+
+torch.cuda.reset_peak_memory_stats()
+torch.cuda.synchronize()
+load_started = time.perf_counter()
+model = AutoModelForCausalLM.from_pretrained(
+    sys.argv[1],
+    device_map='cuda',
+    dtype=runtime_dtype,
+    quantization_config=CompressedTensorsConfig(dequantize=True),
+).to(dtype=runtime_dtype).eval()
+torch.cuda.synchronize()
+load_latency_ms = (time.perf_counter() - load_started) * 1000.0
+load_peak_allocated_bytes = torch.cuda.max_memory_allocated()
+load_peak_reserved_bytes = torch.cuda.max_memory_reserved()
+model_resident_allocated_bytes = torch.cuda.memory_allocated()
+model_resident_reserved_bytes = torch.cuda.memory_reserved()
+
+quantized = [
+    model.get_submodule(name) for name in contract['vllm']['quantized_modules']
+]
+protected = [
+    model.get_submodule(name) for name in contract['vllm']['protected_modules']
+]
+protected_tensors = [
+    model.get_parameter(name) for name in contract['vllm']['protected_tensors']
+]
+assert all(
+    getattr(module, 'quantization_scheme', None) is not None for module in quantized
+)
+assert all(module.weight.dtype == runtime_dtype for module in quantized)
+assert all(getattr(module, 'quantization_scheme', None) is None for module in protected)
+assert all(module.weight.dtype == runtime_dtype for module in protected)
+assert all(parameter.dtype == runtime_dtype for parameter in protected_tensors)
+
+prompt = torch.tensor([prompt_ids], device='cuda')
+
+def generate_once():
+    torch.manual_seed(generate_seed)
+    return model.generate(
+        prompt,
+        max_new_tokens=max_new_tokens,
+        do_sample=True,
+        temperature=0.8,
+        top_k=8,
+        use_cache=True,
+        pad_token_id=0,
+        eos_token_id=[],
+    )
+
+with torch.inference_mode():
+    logits = model(prompt).logits
+    for _ in range(warmup_runs):
+        generate_once()
+    torch.cuda.synchronize()
+    generate_baseline_allocated_bytes = torch.cuda.memory_allocated()
+    generate_baseline_reserved_bytes = torch.cuda.memory_reserved()
+    torch.cuda.reset_peak_memory_stats()
+    latencies_ms = []
+    generated = None
+    for _ in range(timed_runs):
+        torch.cuda.synchronize()
+        generate_started = time.perf_counter()
+        generated = generate_once()
+        torch.cuda.synchronize()
+        latencies_ms.append((time.perf_counter() - generate_started) * 1000.0)
+
+assert generated is not None
+assert torch.isfinite(logits).all()
+assert generated.shape == (1, len(prompt_ids) + max_new_tokens)
+assert generated[0, :len(prompt_ids)].tolist() == prompt_ids
+sorted_latencies_ms = sorted(latencies_ms)
+latency_p90_index = max(0, math.ceil(0.9 * timed_runs) - 1)
+elapsed_seconds = sum(latencies_ms) / 1000.0
+print(json.dumps({
+    'dtype': str(runtime_dtype),
+    'logits_dtype': str(logits.dtype),
+    'quantized_module_count': len(quantized),
+    'protected_module_count': len(protected),
+    'protected_tensor_count': len(protected_tensors),
+    'artifact_contract_validated': True,
+    'runtime_measurement': {
+        'scope': 'fresh-process-transformers-generate-diagnostic',
+        'canonical_performance_acceptance': False,
+        'device_name': torch.cuda.get_device_name(),
+        'device_capability': list(torch.cuda.get_device_capability()),
+        'load_latency_ms': load_latency_ms,
+        'load_peak_allocated_bytes': load_peak_allocated_bytes,
+        'load_peak_reserved_bytes': load_peak_reserved_bytes,
+        'model_resident_allocated_bytes': model_resident_allocated_bytes,
+        'model_resident_reserved_bytes': model_resident_reserved_bytes,
+        'generate': {
+            'warmup_runs': warmup_runs,
+            'timed_runs': timed_runs,
+            'new_tokens_per_run': max_new_tokens,
+            'latencies_ms': latencies_ms,
+            'latency_p50_ms': statistics.median(latencies_ms),
+            'latency_p90_ms': sorted_latencies_ms[latency_p90_index],
+            'throughput_tokens_per_second': (
+                timed_runs * max_new_tokens / elapsed_seconds
+            ),
+            'baseline_allocated_bytes': generate_baseline_allocated_bytes,
+            'baseline_reserved_bytes': generate_baseline_reserved_bytes,
+            'peak_allocated_bytes': torch.cuda.max_memory_allocated(),
+            'peak_reserved_bytes': torch.cuda.max_memory_reserved(),
+        },
+    },
+    'standard_generate': {
+        'passed': True,
+        'use_cache': True,
+        'seed': generate_seed,
+        'prompt_ids': prompt_ids,
+        'max_new_tokens': max_new_tokens,
+        'generated_ids': generated.tolist(),
+    },
+}))
+"""
+
+
 def quantize_rwkv7_oneshot(
     model_factory: Callable[[], torch.nn.Module],
     output_dir: Path,
@@ -590,6 +740,10 @@ def quantize_rwkv7_oneshot(
         destination = output_dir / candidate
         destination.mkdir(parents=True, exist_ok=True)
         try:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+            quantization_started = time.perf_counter()
             result = oneshot(
                 model=model,
                 dataset=calibration_dataset if candidate == "nvfp4-w4a4" else None,
@@ -598,6 +752,25 @@ def quantize_rwkv7_oneshot(
                 pipeline="basic" if candidate == "nvfp4-w4a4" else "datafree",
                 output_dir=None,
             )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            quantization_runtime = {
+                "scope": "llmcompressor-oneshot",
+                "latency_ms": (
+                    time.perf_counter() - quantization_started
+                ) * 1000.0,
+                "cuda_measured": torch.cuda.is_available(),
+                "peak_allocated_bytes": (
+                    torch.cuda.max_memory_allocated()
+                    if torch.cuda.is_available()
+                    else None
+                ),
+                "peak_reserved_bytes": (
+                    torch.cuda.max_memory_reserved()
+                    if torch.cuda.is_available()
+                    else None
+                ),
+            }
             base_model = result.base_model
             first_channel_mix = base_model.blocks[0].ffn
             reference = next(result.parameters())
@@ -647,84 +820,6 @@ def quantize_rwkv7_oneshot(
                 }
             )
             continue
-        reload_script = """
-import json, sys, torch
-from transformers import AutoConfig, AutoModelForCausalLM
-from transformers.utils.quantization_config import CompressedTensorsConfig
-
-config = AutoConfig.from_pretrained(sys.argv[1])
-generate_seed = int(sys.argv[2])
-prompt_ids = json.loads(sys.argv[3])
-max_new_tokens = int(sys.argv[4])
-runtime_dtype = config.dtype
-assert isinstance(runtime_dtype, torch.dtype)
-contract = getattr(config, 'rwkv7_quantization_metadata')
-assert contract['schema_version'] == 1
-assert contract['candidate'] in (
-    'nvfp4-w4a4',
-    'nvfp4-w4a16',
-    'nvfp4-w4a16-protection-ablation',
-    'w8a16-critical-high',
-)
-assert contract['vllm']['architecture'] == 'Rwkv7ForCausalLM'
-assert contract['vllm']['source_format'] == 'standard_hf'
-assert contract['vllm']['legacy_pth_direct_load'] is False
-model = AutoModelForCausalLM.from_pretrained(
-    sys.argv[1],
-    device_map='cuda',
-    dtype=runtime_dtype,
-    quantization_config=CompressedTensorsConfig(dequantize=True),
-).to(dtype=runtime_dtype).eval()
-quantized = [
-    model.get_submodule(name) for name in contract['vllm']['quantized_modules']
-]
-protected = [
-    model.get_submodule(name) for name in contract['vllm']['protected_modules']
-]
-protected_tensors = [
-    model.get_parameter(name) for name in contract['vllm']['protected_tensors']
-]
-assert all(
-    getattr(module, 'quantization_scheme', None) is not None for module in quantized
-)
-assert all(module.weight.dtype == runtime_dtype for module in quantized)
-assert all(getattr(module, 'quantization_scheme', None) is None for module in protected)
-assert all(module.weight.dtype == runtime_dtype for module in protected)
-assert all(parameter.dtype == runtime_dtype for parameter in protected_tensors)
-prompt = torch.tensor([prompt_ids], device='cuda')
-torch.manual_seed(generate_seed)
-with torch.inference_mode():
-    logits = model(prompt).logits
-    generated = model.generate(
-        prompt,
-        max_new_tokens=max_new_tokens,
-        do_sample=True,
-        temperature=0.8,
-        top_k=8,
-        use_cache=True,
-        pad_token_id=0,
-        eos_token_id=[],
-    )
-assert torch.isfinite(logits).all()
-assert generated.shape == (1, len(prompt_ids) + max_new_tokens)
-assert generated[0, :len(prompt_ids)].tolist() == prompt_ids
-print(json.dumps({
-    'dtype': str(runtime_dtype),
-    'logits_dtype': str(logits.dtype),
-    'quantized_module_count': len(quantized),
-    'protected_module_count': len(protected),
-    'protected_tensor_count': len(protected_tensors),
-    'artifact_contract_validated': True,
-    'standard_generate': {
-        'passed': True,
-        'use_cache': True,
-        'seed': generate_seed,
-        'prompt_ids': prompt_ids,
-        'max_new_tokens': max_new_tokens,
-        'generated_ids': generated.tolist(),
-    },
-}))
-"""
         reload_environment = dict(os.environ)
         reload_temporary = destination / ".fresh-reload-tmp"
         reload_temporary.mkdir(exist_ok=True)
@@ -733,11 +828,13 @@ print(json.dumps({
             [
                 sys.executable,
                 "-c",
-                reload_script,
+                _fresh_reload_generate_script(),
                 str(destination),
                 str(_FRESH_RELOAD_GENERATE_SEED),
                 json.dumps(prompt_ids),
                 str(fresh_reload_new_tokens),
+                str(_FRESH_RELOAD_WARMUP_RUNS),
+                str(_FRESH_RELOAD_TIMED_RUNS),
             ],
             capture_output=True,
             text=True,
@@ -759,6 +856,7 @@ print(json.dumps({
                 "output_shape": list(cell_output.shape),
                 "state_shape": list(cell_state.shape),
             },
+            "quantization_runtime": quantization_runtime,
             "fresh_reload": {
                 "passed": reload_run.returncode == 0,
                 "returncode": reload_run.returncode,

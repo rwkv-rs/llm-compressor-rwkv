@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 
 from llmcompressor.modifiers.quantization.rwkv7 import (
     RWKV7CheckpointContract,
+    _fresh_reload_generate_script,
     quantize_rwkv7_oneshot,
 )
 
@@ -45,6 +46,11 @@ def _model(device="cuda"):
 
 
 @pytest.mark.unit
+def test_fresh_reload_program_is_valid_python():
+    compile(_fresh_reload_generate_script(), "<rwkv7-fresh-reload>", "exec")
+
+
+@pytest.mark.unit
 def test_execution_falls_back_only_in_closed_order(tmp_path, monkeypatch):
     calls = []
 
@@ -74,6 +80,7 @@ def test_execution_falls_back_only_in_closed_order(tmp_path, monkeypatch):
     assert calls == ["nvfp4-w4a4", "nvfp4-w4a16"]
     assert metadata["candidate"] == "nvfp4-w4a16"
     assert metadata["quantization_applied"] is True
+    assert metadata["quantization_runtime"]["scope"] == "llmcompressor-oneshot"
     assert metadata["failures"][0]["error"] == "W4A4 unavailable"
 
 
@@ -180,6 +187,11 @@ def test_gb10_real_nvfp4_checkpoint_has_packed_tensors_and_forward(
     assert reload_evidence["protected_module_count"] == 9
     assert reload_evidence["protected_tensor_count"] == 37
     assert reload_evidence["artifact_contract_validated"] is True
+    runtime = reload_evidence["runtime_measurement"]
+    assert runtime["scope"] == "fresh-process-transformers-generate-diagnostic"
+    assert runtime["canonical_performance_acceptance"] is False
+    assert runtime["generate"]["warmup_runs"] == 1
+    assert runtime["generate"]["timed_runs"] == 3
     artifact_contract = metadata["artifact_contract"]
     assert artifact_contract["formal_checkpoint"] is False
     assert artifact_contract["formal_evaluation"] is False
