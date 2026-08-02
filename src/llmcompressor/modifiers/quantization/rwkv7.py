@@ -928,6 +928,20 @@ def build_rwkv7_quantization_recipe(
     return modifier
 
 
+def _load_rwkv7_artifact_contract(output_dir: Path) -> RWKV7ArtifactContract:
+    config = json.loads((output_dir / "config.json").read_text(encoding="utf-8"))
+    try:
+        return RWKV7ArtifactContract.model_validate(config.get(_RWKV7_METADATA_KEY))
+    except ValueError as error:
+        raise RuntimeError(
+            "RWKV-7 serialized compressed artifact metadata is invalid"
+        ) from error
+
+
+def _tensor_owners(tensors: dict[str, tuple[list[int], str]], suffix: str) -> set[str]:
+    return {name.removesuffix(suffix) for name in tensors if name.endswith(suffix)}
+
+
 def audit_rwkv7_quantized_checkpoint(
     output_dir: Path,
     expected_targets: list[str],
@@ -942,23 +956,33 @@ def audit_rwkv7_quantized_checkpoint(
 
     config = json.loads((output_dir / "config.json").read_text(encoding="utf-8"))
     quantization = config.get("quantization_config", {})
-    serialized_contract = config.get(_RWKV7_METADATA_KEY)
-    try:
-        loaded_contract = RWKV7ArtifactContract.model_validate(serialized_contract)
-    except ValueError as error:
-        raise RuntimeError(
-            "RWKV-7 serialized compressed artifact metadata is invalid"
-        ) from error
+    loaded_contract = _load_rwkv7_artifact_contract(output_dir)
     if artifact_contract is not None and loaded_contract != artifact_contract:
         raise RuntimeError("RWKV-7 serialized artifact contract drifted")
     transformers_provenance = validate_rwkv7_transformers_provenance(
         loaded_contract.repository
     )
+    if transformers_provenance != loaded_contract.runtime_provenance:
+        raise RuntimeError(
+            "RWKV-7 serialized runtime provenance differs from the active runtime"
+        )
+    if candidate != loaded_contract.candidate:
+        raise RuntimeError(
+            "RWKV-7 audit candidate differs from serialized artifact contract"
+        )
+    if expected_targets != loaded_contract.vllm.quantized_modules:
+        raise RuntimeError(
+            "RWKV-7 audit targets differ from the complete serialized inventory"
+        )
     expected_format = (
         "pack-quantized"
         if candidate == "w8a16-low-rank-critical-high"
         else "nvfp4-pack-quantized"
     )
+    if loaded_contract.vllm.quantization_format != expected_format:
+        raise RuntimeError(
+            "RWKV-7 serialized quantization format differs from candidate"
+        )
     if (
         quantization.get("quant_method") != "compressed-tensors"
         or quantization.get("quantization_status") != "compressed"
@@ -986,6 +1010,32 @@ def audit_rwkv7_quantized_checkpoint(
                     handle.get_slice(name).get_shape(),
                     handle.get_slice(name).get_dtype(),
                 )
+    expected_target_set = set(expected_targets)
+    expected_tensor_owners = {
+        ".weight_packed": expected_target_set,
+        ".weight_scale": expected_target_set,
+        ".weight_shape": (
+            expected_target_set
+            if candidate == "w8a16-low-rank-critical-high"
+            else set()
+        ),
+        ".weight_global_scale": (
+            set()
+            if candidate == "w8a16-low-rank-critical-high"
+            else expected_target_set
+        ),
+        ".input_global_scale": (
+            expected_target_set if candidate == "nvfp4-w4a4" else set()
+        ),
+    }
+    for suffix, expected_owners in expected_tensor_owners.items():
+        actual_owners = _tensor_owners(tensors, suffix)
+        if actual_owners != expected_owners:
+            raise RuntimeError(
+                "RWKV-7 physical compressed tensor inventory drifted: "
+                f"suffix={suffix} expected={sorted(expected_owners)} "
+                f"actual={sorted(actual_owners)}"
+            )
     legacy_weight_aliases = sorted(set(expected_targets) & tensors.keys())
     if legacy_weight_aliases:
         raise RuntimeError(
@@ -1034,18 +1084,23 @@ def audit_rwkv7_quantized_checkpoint(
             and tensors[f"{target}.weight_shape"][1] != "I64"
         ):
             raise RuntimeError(f"RWKV-7 target has drifted shape dtype: {target}")
-    protected_names = set()
-    if artifact_contract is not None:
-        protected_names.update(artifact_contract.vllm.protected_tensors)
-        protected_names.update(
-            f"{name}.weight" for name in artifact_contract.vllm.protected_modules
+    protected_names = set(loaded_contract.vllm.protected_tensors)
+    protected_names.update(
+        f"{name}.weight" for name in loaded_contract.vllm.protected_modules
+    )
+    missing_protected = sorted(protected_names - tensors.keys())
+    if missing_protected:
+        raise RuntimeError(
+            "RWKV-7 artifact is missing protected physical tensors: "
+            f"{missing_protected}"
         )
-        for name in artifact_contract.vllm.protected_modules:
-            if any(key.startswith(f"{name}.weight_") for key in tensors):
-                raise RuntimeError(
-                    f"RWKV-7 protected module was compressed: {name}"
-                )
-    protected = sorted(protected_names & tensors.keys())
+    for name in loaded_contract.vllm.protected_modules:
+        if any(key.startswith(f"{name}.weight_") for key in tensors):
+            raise RuntimeError(f"RWKV-7 protected module was compressed: {name}")
+    for name in loaded_contract.vllm.protected_tensors:
+        if any(key.startswith(f"{name}_") for key in tensors):
+            raise RuntimeError(f"RWKV-7 protected tensor was transformed: {name}")
+    protected = sorted(protected_names)
     return {
         "format": expected_format,
         "targets": expected_targets,
@@ -1053,7 +1108,7 @@ def audit_rwkv7_quantized_checkpoint(
         "protected_tensor_count": len(protected),
         "tensor_count": len(tensors),
         "input_quantized": input_quantized,
-        "artifact_contract_serialized": artifact_contract is not None,
+        "artifact_contract_serialized": True,
         "transformers_provenance": transformers_provenance.model_dump(mode="json"),
         "standard_linear_ownership": True,
         "legacy_weight_aliases": legacy_weight_aliases,
@@ -1082,6 +1137,7 @@ def _fresh_reload_generate_script() -> str:
     return r"""
 import json, math, statistics, sys, time, torch
 from llmcompressor.modifiers.quantization.rwkv7 import (
+    RWKV7ArtifactContract,
     RWKV7RepositoryContract,
     validate_rwkv7_transformers_provenance,
 )
@@ -1089,9 +1145,16 @@ from llmcompressor.modifiers.quantization.rwkv7 import (
 with open(f'{sys.argv[1]}/config.json', encoding='utf-8') as config_handle:
     serialized_config = json.load(config_handle)
 serialized_contract = serialized_config['rwkv7_quantization_metadata']
+contract_model = RWKV7ArtifactContract.model_validate(serialized_contract)
 transformers_provenance = validate_rwkv7_transformers_provenance(
-    RWKV7RepositoryContract.model_validate(serialized_contract['repository'])
-).model_dump(mode='json')
+    RWKV7RepositoryContract.model_validate(contract_model.repository)
+)
+if transformers_provenance != contract_model.runtime_provenance:
+    raise RuntimeError(
+        'RWKV-7 serialized runtime provenance differs from the active runtime'
+    )
+transformers_provenance = transformers_provenance.model_dump(mode='json')
+contract = contract_model.model_dump(mode='json')
 
 from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.utils.quantization_config import CompressedTensorsConfig
@@ -1106,7 +1169,7 @@ runtime_dtype = config.dtype
 assert isinstance(runtime_dtype, torch.dtype)
 assert warmup_runs >= 1
 assert timed_runs >= 1
-contract = getattr(config, 'rwkv7_quantization_metadata')
+assert getattr(config, 'rwkv7_quantization_metadata') == contract
 assert contract['schema_version'] == 3
 assert contract['candidate'] in (
     'nvfp4-w4a4',

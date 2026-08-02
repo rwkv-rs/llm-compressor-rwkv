@@ -54,7 +54,7 @@ def _transformers_provenance():
     )
 
 
-def _runtime_provenance():
+def _runtime_provenance(*_args):
     return _transformers_provenance().model_copy(
         update={"operator_runtime": _operator_runtime_provenance()}
     )
@@ -506,12 +506,9 @@ def standard_linear_w8_artifact(tmp_path, monkeypatch):
     assert audit["targets"] == contract.vllm.quantized_modules
     assert audit["quantized_weight_names"] == contract.vllm.quantized_weight_names
     assert audit["legacy_weight_aliases"] == []
-    assert audit["transformers_provenance"] == {
-        "repository": "https://github.com/rwkv-rs/transformers-rwkv.git",
-        "revision": "2696927df9363b5fa175076bb827ba4da2c4e581",
-        "installation_source": "editable-git",
-        "editable": True,
-    }
+    assert audit["transformers_provenance"] == _runtime_provenance().model_dump(
+        mode="json"
+    )
     assert not (tmp_path / "rwkv7_low_rank_w8.safetensors").exists()
     serialized_config = json.loads(
         (tmp_path / "config.json").read_text(encoding="utf-8")
@@ -540,6 +537,57 @@ def test_low_rank_w8_uses_standard_linear_serialization_and_audit(
 
 
 @pytest.mark.integration
+def test_audit_uses_complete_serialized_contract_without_external_copy(
+    standard_linear_w8_artifact,
+):
+    artifact_path, contract, _ = standard_linear_w8_artifact
+
+    audit = audit_rwkv7_quantized_checkpoint(
+        artifact_path,
+        contract.vllm.quantized_modules,
+        contract.candidate,
+    )
+
+    assert audit["artifact_contract_serialized"] is True
+    assert audit["protected_tensor_count"] == (
+        len(contract.vllm.protected_tensors)
+        + len(contract.vllm.protected_modules)
+    )
+
+
+@pytest.mark.integration
+def test_audit_rejects_partial_target_inventory(standard_linear_w8_artifact):
+    artifact_path, contract, _ = standard_linear_w8_artifact
+
+    with pytest.raises(RuntimeError, match="complete serialized inventory"):
+        audit_rwkv7_quantized_checkpoint(
+            artifact_path,
+            contract.vllm.quantized_modules[:-1],
+            contract.candidate,
+        )
+
+
+@pytest.mark.integration
+def test_audit_rejects_missing_protected_physical_tensor(
+    standard_linear_w8_artifact,
+):
+    from safetensors.torch import load_file, save_file
+
+    artifact_path, contract, _ = standard_linear_w8_artifact
+    shard = artifact_path / "model.safetensors"
+    tensors = load_file(shard)
+    tensors.pop(contract.vllm.protected_tensors[0])
+    save_file(tensors, shard)
+
+    with pytest.raises(RuntimeError, match="missing protected physical tensors"):
+        audit_rwkv7_quantized_checkpoint(
+            artifact_path,
+            contract.vllm.quantized_modules,
+            contract.candidate,
+        )
+
+
+@pytest.mark.integration
 def test_compressed_artifact_rejects_unapplied_recipe_metadata(
     standard_linear_w8_artifact,
 ):
@@ -558,6 +606,23 @@ def test_compressed_artifact_rejects_unapplied_recipe_metadata(
         json.dumps(serialized_config, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    fresh_process = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _fresh_reload_generate_script(),
+            str(artifact_path),
+            "20260801",
+            "[1, 2, 3, 4]",
+            "1",
+            "1",
+            "1",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert fresh_process.returncode != 0
+    assert "must record applied quantization" in fresh_process.stderr
     with pytest.raises(RuntimeError, match="artifact metadata is invalid"):
         audit_rwkv7_quantized_checkpoint(
             artifact_path,
