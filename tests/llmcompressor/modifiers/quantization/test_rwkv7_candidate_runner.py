@@ -1116,7 +1116,15 @@ def test_audit_accepts_serialized_ignore_order_variation(
 @pytest.mark.integration
 @pytest.mark.parametrize(
     "drift",
-    ["missing-ignore", "extra-ignore", "expanded-targets"],
+    [
+        "missing-ignore",
+        "extra-ignore",
+        "duplicate-ignore",
+        "empty-ignore",
+        "empty-string-ignore",
+        "non-string-ignore",
+        "expanded-targets",
+    ],
 )
 def test_audit_rejects_serialized_producer_contract_drift(
     standard_linear_w8_artifact,
@@ -1132,6 +1140,18 @@ def test_audit_rejects_serialized_producer_contract_drift(
     elif drift == "extra-ignore":
         quantization["ignore"].append("model.blocks.0.unowned")
         error_match = "protected Linear ignore inventory"
+    elif drift == "duplicate-ignore":
+        quantization["ignore"].append(quantization["ignore"][0])
+        error_match = "must not contain duplicates"
+    elif drift == "empty-ignore":
+        quantization["ignore"] = []
+        error_match = "must be a non-empty list"
+    elif drift == "empty-string-ignore":
+        quantization["ignore"].append("")
+        error_match = "entries must be non-empty"
+    elif drift == "non-string-ignore":
+        quantization["ignore"].append(7)
+        error_match = "entries must be non-empty"
     else:
         quantization["config_groups"]["group_0"]["targets"] = (
             contract.vllm.quantized_modules

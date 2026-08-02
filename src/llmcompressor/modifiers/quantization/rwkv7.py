@@ -1598,11 +1598,18 @@ def audit_rwkv7_quantized_checkpoint(
             f"candidate contract: expected={expected_group} actual={group}"
         )
     serialized_ignore = quantization.get("ignore")
-    if not isinstance(serialized_ignore, list) or not all(
-        isinstance(name, str) for name in serialized_ignore
-    ):
+    if not isinstance(serialized_ignore, list) or not serialized_ignore:
         raise RuntimeError(
-            "RWKV-7 serialized quantization ignore must be a list of Linear FQNs"
+            "RWKV-7 serialized quantization ignore must be a non-empty list"
+        )
+    if not all(isinstance(name, str) and bool(name) for name in serialized_ignore):
+        raise RuntimeError(
+            "RWKV-7 serialized quantization ignore entries must be non-empty "
+            "Linear FQN strings"
+        )
+    if len(serialized_ignore) != len(set(serialized_ignore)):
+        raise RuntimeError(
+            "RWKV-7 serialized quantization ignore must not contain duplicates"
         )
     expected_ignore = set(loaded_contract.vllm.protected_linear_modules)
     actual_ignore = set(serialized_ignore)
